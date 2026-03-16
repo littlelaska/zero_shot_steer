@@ -22,7 +22,7 @@ OUT_DIR="./zero_shot_steering/${MODE}/${MODEL_NAME}/${DATASET}"
 mkdir -p "$OUT_DIR"
 
 # 数据集路径设置 (复用目标域的 train 作为校准，dev 作为测试)
-BASE_DATA_DIR="/code/data/${DATASET}"
+BASE_DATA_DIR="data/${DATASET}"
 CALIB_FILE="${BASE_DATA_DIR}/train.json"
 TEST_FILE="${BASE_DATA_DIR}/dev.json"
 
