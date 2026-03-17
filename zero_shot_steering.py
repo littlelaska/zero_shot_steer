@@ -62,7 +62,7 @@ def _format_options_from_ex(ex):
         return "Options:\n" + "\n".join([f"{k}) {v}" for k, v in opt_obj.items()])
     return ""
 
-def build_prompts(ex, tokenizer=None, repeat=False):
+def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False):
     """
     构建 Prompt。如果 repeat=True，则应用论文中的 Query + Query 策略。
     """
@@ -71,6 +71,8 @@ def build_prompts(ex, tokenizer=None, repeat=False):
     opts = _format_options_from_ex(ex)
     
     base_query = f"Context:\n{ctx}\n\nQuestion:\n{q}\n\n{opts}\n\nPlease provide the reasoning and the answer."
+    if reverse_context:
+        base_query = f"Question:\n{q}\n\n{opts}\n\nContext:\n{ctx}\n\nPlease provide the reasoning and the answer."
     
     # 核心：复现论文的 Prompt Repetition
     if repeat:
@@ -234,6 +236,8 @@ def main():
     parser.add_argument("--eval_batch_size", type=int, default=4)
     parser.add_argument("--intervention_mode", type=str, default="static", choices=["static", "dynamic"])
     parser.add_argument("--alpha", type=float, default=1.0, help="干预强度")
+    # laska 20260317 新的测试逻辑
+    parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
     
     args = parser.parse_args()
 
@@ -269,7 +273,7 @@ def main():
     
     for i in range(0, len(test_data), args.eval_batch_size):
         batch_ex = test_data[i : i + args.eval_batch_size]
-        batch_prompts = [build_prompts(x, tokenizer, repeat=False) for x in batch_ex] # 注意测试时是单次 Prompt!
+        batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
         
         batch_outputs = steerer.generate_with_steering(
             batch_prompts, 
