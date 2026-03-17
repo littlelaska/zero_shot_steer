@@ -118,7 +118,6 @@ class ActivationSteerer:
         self.layer_idx = layer_idx
         self.device = model.device
         self.steering_vector = None # 用于存储计算出的 Δh
-
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -166,10 +165,9 @@ class ActivationSteerer:
 
         # 差分: Δh = h2 - h1
         diffs = h2 - h1 
-        
         # 归因均值: 计算整个校准集的平均方向
         self.steering_vector = diffs.mean(dim=0) 
-        print(f"[Steering] Vector computed. L2 Norm: {torch.norm(self.steering_vector):.4f}")
+        
         return self.steering_vector
 
     def generate_with_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static"):
@@ -217,6 +215,73 @@ class ActivationSteerer:
             handle.remove() # 确保 Hook 被移除
             
         return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
+    
+    # ... 原有的 __init__ 和 extract_features 保持不变 ...
+
+    def generate_with_instance_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static"):
+        """
+        [新增功能] 针对每个 Query 实时计算 Δh 并干预
+        """
+        # 1. 准备 Single 和 Repeat 两种 Prompt
+        prompts_single = [p for p in prompts] # 这里的 p 已经是 build_prompts(repeat=False) 后的结果
+        # 注意：这里需要重新 build 带有 repeat=True 的版本用于计算向量
+        # 为了方便，我们假设传入的是原始 data 列表，或者在外部处理好。
+        # 这里演示在内部重新构建：
+        
+        # 2. 实时计算当前 Batch 的专属 Δh
+        # 注意：这里需要调用你之前定义的 build_prompts 逻辑，或者传入已处理好的 prompts
+        # 为了逻辑清晰，我们假设此函数接收的是 list of dict (raw_data)
+        raw_samples = prompts # 假设此时传入的是原始数据列表
+        p_s = [build_prompts(x, self.tokenizer, repeat=False) for x in raw_samples]
+        p_r = [build_prompts(x, self.tokenizer, repeat=True) for x in raw_samples]
+
+        print(f" -> Calculating instance-specific Δh for batch (size={len(raw_samples)})...")
+        h1 = self.extract_features(p_s, batch_size=len(p_s)) # [B, D]
+        h2 = self.extract_features(p_r, batch_size=len(p_r)) # [B, D]
+        
+        # 计算每一条数据自己的差分向量
+        batch_diffs = (h2 - h1) * alpha # [B, D]
+        batch_diffs = batch_diffs.to(self.model.dtype)
+
+        # 3. 定义适配 Batch 的 Hook
+        def instance_adapter_hook(module, args, output):
+            h = output[0] if isinstance(output, tuple) else output
+            seq_len = h.shape[1]
+            
+            # 判断是否干预（逻辑与原代码一致）
+            should_intervene = False
+            if intervention_mode == "static" and seq_len > 1:
+                should_intervene = True 
+            elif intervention_mode == "dynamic":
+                should_intervene = True
+
+            if should_intervene:
+                # 动态匹配设备并将 Δh 注入对应的样本
+                vec_inject = batch_diffs.to(h.device)
+                
+                # h 的形状是 [B, L, D]，我们要把 batch_diffs [B, D] 加到最后一个 token [B, -1, D]
+                # 这一行是核心：利用广播机制或直接索引加法
+                h[:, -1, :] = h[:, -1, :] + vec_inject
+                
+            return (h,) + output[1:] if isinstance(output, tuple) else h
+
+        # 4. 执行推理
+        inputs = self.tokenizer(p_s, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+        layer_module = self._get_layer_module()
+        handle = layer_module.register_forward_hook(instance_adapter_hook)
+        
+        try:
+            with torch.no_grad():
+                gen_out = self.model.generate(
+                    **inputs,
+                    max_new_tokens=4096,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.pad_token_id
+                )
+        finally:
+            handle.remove()
+            
+        return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
 
 # ==========================================
 # 3. 主流程
@@ -238,6 +303,7 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0, help="干预强度")
     # laska 20260317 新的测试逻辑
     parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
+    parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
     
     args = parser.parse_args()
 
@@ -271,15 +337,35 @@ def main():
     total_count = 0
     pbar = tqdm(total=len(test_data), desc="Evaluating")
     
+    # 在 main() 中修改推理循环部分
     for i in range(0, len(test_data), args.eval_batch_size):
         batch_ex = test_data[i : i + args.eval_batch_size]
-        batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
         
-        batch_outputs = steerer.generate_with_steering(
-            batch_prompts, 
-            alpha=args.alpha, 
-            intervention_mode=args.intervention_mode
-        )
+        # --- 修改点：根据需求选择干预模式 ---
+        if args.instance_steering:
+            # 模式 A: 每个数据算自己的向量 (传入原始 batch 数据)
+            batch_outputs = steerer.generate_with_instance_steering(
+                batch_ex, 
+                alpha=args.alpha, 
+                intervention_mode=args.intervention_mode
+            )
+        else:
+            # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)
+            batch_prompts = [build_prompts(x, tokenizer, repeat=False) for x in batch_ex]
+            batch_outputs = steerer.generate_with_steering(
+                batch_prompts, 
+                alpha=args.alpha, 
+                intervention_mode=args.intervention_mode
+            )
+        # --- 剩下的保存逻辑不变 ---
+        # batch_ex = test_data[i : i + args.eval_batch_size]
+        # batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
+        
+        # batch_outputs = steerer.generate_with_steering(
+        #     batch_prompts, 
+        #     alpha=args.alpha, 
+        #     intervention_mode=args.intervention_mode
+        # )
 
         with open(args.output_file, "a", encoding="utf-8") as f:
             for j, output_text in enumerate(batch_outputs):
