@@ -73,6 +73,7 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False):
     base_query = f"Context:\n{ctx}\n\nQuestion:\n{q}\n\n{opts}\n\nPlease provide the reasoning and the answer."
     if reverse_context:
         base_query = f"Question:\n{q}\n\n{opts}\n\nContext:\n{ctx}\n\nPlease provide the reasoning and the answer."
+        base_query = f"Question:\n{q}\n\nOptions:{opts}\n\nContext:\n{ctx}\n\nPlease provide the reasoning and the answer."
     
     # 核心：复现论文的 Prompt Repetition
     if repeat:
@@ -174,34 +175,39 @@ class ActivationSteerer:
         """
         Step 4: 将向量注入到残差流进行干预
         """
-        if self.steering_vector is None:
+        if self.steering_vector is None and alpha != 0.0:
             raise ValueError("Steering vector not computed! Run compute_steering_vector first.")
+        if alpha !=0.0:   # 对中间向量进行干预
+            print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
+            vec_base = (self.steering_vector * alpha).to(self.model.dtype)
 
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
-        # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
-        vec_base = (self.steering_vector * alpha).to(self.model.dtype)
-
-        def adapter_hook(module, args, output):
-            h = output[0] if isinstance(output, tuple) else output
-            seq_len = h.shape[1]
-            
-            should_intervene = False
-            if intervention_mode == "static" and seq_len > 1:
-                should_intervene = True # 仅在 Prefill 阶段干预
-            elif intervention_mode == "dynamic":
-                should_intervene = True # 持续干预
-
-            if should_intervene:
-                # 【修改点】动态匹配当前层所在设备 (Dynamic device matching)
-                vec_inject = vec_base.to(h.device)
+            def adapter_hook(module, args, output):
+                h = output[0] if isinstance(output, tuple) else output
+                seq_len = h.shape[1]
                 
-                # 直接加上我们计算好的差分向量
-                h[:, -1, :] = h[:, -1, :] + vec_inject
-                
-            return (h,) + output[1:] if isinstance(output, tuple) else h
+                should_intervene = False
+                if intervention_mode == "static" and seq_len > 1:
+                    should_intervene = True # 仅在 Prefill 阶段干预
+                elif intervention_mode == "dynamic":
+                    should_intervene = True # 持续干预
 
-        layer_module = self._get_layer_module()
-        handle = layer_module.register_forward_hook(adapter_hook)
+                if should_intervene:
+                    # 【修改点】动态匹配当前层所在设备 (Dynamic device matching)
+                    vec_inject = vec_base.to(h.device)
+                    
+                    # 直接加上我们计算好的差分向量
+                    h[:, -1, :] = h[:, -1, :] + vec_inject
+                    
+                return (h,) + output[1:] if isinstance(output, tuple) else h
+
+            layer_module = self._get_layer_module()
+            handle = layer_module.register_forward_hook(adapter_hook)
+        else:
+            print(f"\n[Steering] Alpha is 0.0, no intervention applied.")
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            handle = None
         
         try:
             with torch.no_grad():
@@ -212,7 +218,8 @@ class ActivationSteerer:
                     pad_token_id=self.tokenizer.pad_token_id
                 )
         finally:
-            handle.remove() # 确保 Hook 被移除
+            if alpha != 0.0 and handle is not None:
+                handle.remove() # 确保 Hook 被移除
             
         return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
     
@@ -304,20 +311,28 @@ def main():
     # laska 20260317 新的测试逻辑
     parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
     parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
+    parser.add_argument("--repeat", default=False, action="store_true", help="是否对prompt进行重复，作为一个baseline")
     
     args = parser.parse_args()
 
     print(f"=== Zero-shot Steering PoC ===")
     print(f"Model: {args.model}")
+    print(f"Dataset:{args.test_file}")
     print(f"Layer: {args.layer} | Alpha: {args.alpha} | Mode: {args.intervention_mode}")
     print(f"==============================")
     
     # 1. Load Data
-    calib_data = load_data_file(args.calib_file, max_n=args.calib_samples)
+    if not args.instance_steering and args.alpha != 0.0:
+        print(f"Loading calibration data from {args.calib_file} (max {args.calib_samples} samples)...")
+        calib_data = load_data_file(args.calib_file, max_n=args.calib_samples)
     test_data = load_data_file(args.test_file, max_n=None)
     
-    if not calib_data or not test_data:
-        print("[Error] Data empty.")
+    if not args.instance_steering and args.alpha != 0.0:
+        if not calib_data:
+            print("[Error] Calibration data empty.")
+            return
+    if not test_data:
+        print("[Error] Test Data empty.")
         return
 
     # 2. Load Model
@@ -325,8 +340,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
     steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer)
+
     # 3. Compute Steering Vector (Zero-shot, No Labels Needed)
-    steerer.compute_steering_vector(calib_data, batch_size=args.eval_batch_size)
+    # laska修改，某些情况下不需要进入这个函数 1. instance steering 模式下每个样例单独计算向量 2. alpha=0 的情况下不需要计算向量（虽然不计算向量也不会报错，但为了效率我们直接跳过）
+    if (not args.instance_steering) and (args.alpha != 0.0):
+        steerer.compute_steering_vector(calib_data, batch_size=args.eval_batch_size)
 
     # 4. Inference on Test Set
     print(f"\n=== Starting Inference ===")
@@ -342,7 +360,7 @@ def main():
         batch_ex = test_data[i : i + args.eval_batch_size]
         
         # --- 修改点：根据需求选择干预模式 ---
-        if args.instance_steering:
+        if args.instance_steering:   # 针对单个样例进行干预
             # 模式 A: 每个数据算自己的向量 (传入原始 batch 数据)
             batch_outputs = steerer.generate_with_instance_steering(
                 batch_ex, 
@@ -351,21 +369,18 @@ def main():
             )
         else:
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)
-            batch_prompts = [build_prompts(x, tokenizer, repeat=False) for x in batch_ex]
+            # baseline的单个prompt、reverse以及重复prompt将在这个分支中进行计算
+            if args.repeat:   # 对prompt进行重复计算，作为一个baseline
+                batch_prompts = [build_prompts(x, tokenizer, repeat=True) for x in batch_ex]
+            else:     # 其他情况（包括reverse）仍然使用原来的构建方式
+                batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex]
             batch_outputs = steerer.generate_with_steering(
                 batch_prompts, 
                 alpha=args.alpha, 
                 intervention_mode=args.intervention_mode
             )
         # --- 剩下的保存逻辑不变 ---
-        # batch_ex = test_data[i : i + args.eval_batch_size]
         # batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
-        
-        # batch_outputs = steerer.generate_with_steering(
-        #     batch_prompts, 
-        #     alpha=args.alpha, 
-        #     intervention_mode=args.intervention_mode
-        # )
 
         with open(args.output_file, "a", encoding="utf-8") as f:
             for j, output_text in enumerate(batch_outputs):
