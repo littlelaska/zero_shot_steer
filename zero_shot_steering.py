@@ -70,17 +70,17 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False):
     q = ex.get("question", "")
     opts = _format_options_from_ex(ex)
     
-    base_query = f"Context:\n{ctx}\n\nQuestion:\n{q}\n\n{opts}\n\nPlease provide the reasoning and the answer."
+    tail_prompt = "Please provide the reasoning and the answer."
+    base_query = f"Context:\n{ctx}\n\nQuestion:\n{q}\n\n{opts}\n\n"
     if reverse_context:
-        base_query = f"Question:\n{q}\n\n{opts}\n\nContext:\n{ctx}\n\nPlease provide the reasoning and the answer."
-        base_query = f"Question:\n{q}\n\nOptions:{opts}\n\nContext:\n{ctx}\n\nPlease provide the reasoning and the answer."
+        base_query = f"Question:\n{q}\n\n{opts}\n\nContext:\n{ctx}\n\n"
     
     # 核心：复现论文的 Prompt Repetition
     if repeat:
         # 你也可以在这里尝试论文里的变体：base_query + "\n\nLet me repeat that:\n\n" + base_query
-        user_content = base_query + "\n\n" + base_query 
+        user_content = base_query + base_query + tail_prompt
     else:
-        user_content = base_query
+        user_content = base_query + tail_prompt
     
     if tokenizer and hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -113,7 +113,7 @@ def check_is_correct(prediction, ground_truth):
 # ==========================================
 
 class ActivationSteerer:
-    def __init__(self, model, tokenizer, layer_idx: int):
+    def __init__(self, model, tokenizer, layer_idx: int, batch_size: int = 4, max_length: int = 2048):
         self.model = model
         self.tokenizer = tokenizer
         self.layer_idx = layer_idx
@@ -122,6 +122,8 @@ class ActivationSteerer:
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.batch_size = batch_size
+        self.max_length = max_length # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
 
     def _get_layer_module(self):
         """自动寻找各模型的 transformer layers 容器"""
@@ -137,12 +139,16 @@ class ActivationSteerer:
         raise AttributeError(f"Could not find layers in {type(self.model)}")
 
     @torch.no_grad()
-    def extract_features(self, prompts: List[str], batch_size=4):
+    def extract_features(self, prompts: List[str], batch_size: int, max_length: int = None):
         """提取指定层最后一个 Token 的隐状态"""
+        # laska 修改，新增 max_length 参数，控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
+        if max_length is None:
+            max_length = self.max_length
         all_hiddens = []
         for i in range(0, len(prompts), batch_size):
             batch_prompts = prompts[i : i + batch_size]
-            inputs = self.tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            # inputs = self.tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            inputs = self.tokenizer(batch_prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
             
             outputs = self.model(**inputs, output_hidden_states=True)
             target_idx = self.layer_idx + 1 if self.layer_idx >= 0 else self.layer_idx
@@ -153,10 +159,11 @@ class ActivationSteerer:
             
         return torch.cat(all_hiddens, dim=0)
 
-    def compute_steering_vector(self, data_samples, batch_size=4):
+    def compute_steering_vector(self, data_samples):
         """
         Step 1 & 2 & 3: 计算 h_single 和 h_repeat，求差分并平均
         """
+        batch_size = self.batch_size
         print(f"\n[Steering] Computing difference vector over {len(data_samples)} calibration samples...")
         prompts_single = [build_prompts(x, self.tokenizer, repeat=False) for x in data_samples]
         prompts_repeat = [build_prompts(x, self.tokenizer, repeat=True) for x in data_samples]
@@ -171,15 +178,18 @@ class ActivationSteerer:
         
         return self.steering_vector
 
-    def generate_with_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static"):
+    def generate_with_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static", max_length: int = None):
         """
         Step 4: 将向量注入到残差流进行干预
         """
         if self.steering_vector is None and alpha != 0.0:
             raise ValueError("Steering vector not computed! Run compute_steering_vector first.")
+        if max_length is None:
+            max_length = self.max_length
         if alpha !=0.0:   # 对中间向量进行干预
             print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            # inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
             # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
             vec_base = (self.steering_vector * alpha).to(self.model.dtype)
 
@@ -206,9 +216,11 @@ class ActivationSteerer:
             handle = layer_module.register_forward_hook(adapter_hook)
         else:
             print(f"\n[Steering] Alpha is 0.0, no intervention applied.")
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            # inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
             handle = None
         
+        self.model.eval()
         try:
             with torch.no_grad():
                 gen_out = self.model.generate(
@@ -225,10 +237,13 @@ class ActivationSteerer:
     
     # ... 原有的 __init__ 和 extract_features 保持不变 ...
 
-    def generate_with_instance_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static"):
+    def generate_with_instance_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static", max_length: int = None):
         """
         [新增功能] 针对每个 Query 实时计算 Δh 并干预
         """
+        # laska 新增，初始化maxlength，避免不同padding长度带来的影响
+        if max_length is None:
+            max_length = self.max_length
         # 1. 准备 Single 和 Repeat 两种 Prompt
         prompts_single = [p for p in prompts] # 这里的 p 已经是 build_prompts(repeat=False) 后的结果
         # 注意：这里需要重新 build 带有 repeat=True 的版本用于计算向量
@@ -273,10 +288,12 @@ class ActivationSteerer:
             return (h,) + output[1:] if isinstance(output, tuple) else h
 
         # 4. 执行推理
-        inputs = self.tokenizer(p_s, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+        # inputs = self.tokenizer(p_s, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
+        inputs = self.tokenizer(p_s, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
         layer_module = self._get_layer_module()
         handle = layer_module.register_forward_hook(instance_adapter_hook)
         
+        self.model.eval()
         try:
             with torch.no_grad():
                 gen_out = self.model.generate(
@@ -312,7 +329,8 @@ def main():
     parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
     parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
     parser.add_argument("--repeat", default=False, action="store_true", help="是否对prompt进行重复，作为一个baseline")
-    
+    parser.add_argument("--max_length", type=int, default=2048, help="控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异")
+
     args = parser.parse_args()
 
     print(f"=== Zero-shot Steering PoC ===")
@@ -339,12 +357,12 @@ def main():
     print(f"Loading Model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
-    steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer)
+    steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
 
     # 3. Compute Steering Vector (Zero-shot, No Labels Needed)
     # laska修改，某些情况下不需要进入这个函数 1. instance steering 模式下每个样例单独计算向量 2. alpha=0 的情况下不需要计算向量（虽然不计算向量也不会报错，但为了效率我们直接跳过）
     if (not args.instance_steering) and (args.alpha != 0.0):
-        steerer.compute_steering_vector(calib_data, batch_size=args.eval_batch_size)
+        steerer.compute_steering_vector(calib_data)
 
     # 4. Inference on Test Set
     print(f"\n=== Starting Inference ===")
@@ -372,8 +390,12 @@ def main():
             # baseline的单个prompt、reverse以及重复prompt将在这个分支中进行计算
             if args.repeat:   # 对prompt进行重复计算，作为一个baseline
                 batch_prompts = [build_prompts(x, tokenizer, repeat=True) for x in batch_ex]
+                # print(f"Batch Prompts Example (Repeat):\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
+                # exit()
             else:     # 其他情况（包括reverse）仍然使用原来的构建方式
                 batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex]
+                # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
+                # exit()
             batch_outputs = steerer.generate_with_steering(
                 batch_prompts, 
                 alpha=args.alpha, 
