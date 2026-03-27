@@ -6,14 +6,6 @@ import torch
 from tqdm import tqdm
 from typing import List
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import seaborn as sns
-import pandas as pd
-import numpy as np
-from sklearn.manifold import TSNE
-import torch.nn as nn
-from typing import Dict, List
 
 # ==========================================
 # 1. 基础组件与数据处理
@@ -121,7 +113,7 @@ def check_is_correct(prediction, ground_truth):
 # ==========================================
 
 class ActivationSteerer:
-    def __init__(self, model, tokenizer, layer_idx: int, max_length: int, batch_size: int = 4):
+    def __init__(self, model, tokenizer, layer_idx: int, batch_size: int = 4, max_length: int = 2048):
         self.model = model
         self.tokenizer = tokenizer
         self.layer_idx = layer_idx
@@ -131,12 +123,7 @@ class ActivationSteerer:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.batch_size = batch_size
-        if max_length is not None:   # 非空的时候
-            self.max_length = max_length
-            self.padding = "max_length"
-        else:
-            self.max_length = 8192
-            self.padding = True # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
+        self.max_length = max_length # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
 
     def _get_layer_module(self):
         """自动寻找各模型的 transformer layers 容器"""
@@ -155,16 +142,13 @@ class ActivationSteerer:
     def extract_features(self, prompts: List[str], batch_size: int, max_length: int = None):
         """提取指定层最后一个 Token 的隐状态"""
         # laska 修改，新增 max_length 参数，控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
-        if max_length is not None:
-            padding = "max_length"
-        else:
+        if max_length is None:
             max_length = self.max_length
-            padding = True
         all_hiddens = []
         for i in range(0, len(prompts), batch_size):
             batch_prompts = prompts[i : i + batch_size]
             # inputs = self.tokenizer(batch_prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
-            inputs = self.tokenizer(batch_prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            inputs = self.tokenizer(batch_prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
             
             outputs = self.model(**inputs, output_hidden_states=True)
             target_idx = self.layer_idx + 1 if self.layer_idx >= 0 else self.layer_idx
@@ -180,29 +164,12 @@ class ActivationSteerer:
         Step 1 & 2 & 3: 计算 h_single 和 h_repeat，求差分并平均
         """
         batch_size = self.batch_size
-        # print(f"\n[Steering] Computing difference vector over {len(data_samples)} calibration samples...")
-        print(f"\n[Steering] Computing normalized difference vector...")
+        print(f"\n[Steering] Computing difference vector over {len(data_samples)} calibration samples...")
         prompts_single = [build_prompts(x, self.tokenizer, repeat=False) for x in data_samples]
         prompts_repeat = [build_prompts(x, self.tokenizer, repeat=True) for x in data_samples]
-        
-        # 1. 提取两种 Prompt 的隐状态，特征
+
         h1 = self.extract_features(prompts_single, batch_size)
         h2 = self.extract_features(prompts_repeat, batch_size)
-
-        # # 2. 计算平均差异向量
-        # diffs = h2 - h1 
-        # mean_diff = diffs.mean(dim=0) # [D]
-
-        # # 3. L2 归一化核心逻辑
-        # # 使用 FP32 计算模长以确保稳定性
-        # norm = torch.norm(mean_diff, p=2)   # p=2代表用L2范数
-
-        # if norm > 0:
-        #     self.steering_vector = mean_diff / norm
-        #     print(f" -> Original norm: {norm:.4f}, Vector has been normalized to unit length.")
-        # else:
-        #     self.steering_vector = mean_diff
-        #     print(" [Warning] Difference vector norm is 0, skipping normalization.")
 
         # 差分: Δh = h2 - h1
         diffs = h2 - h1 
@@ -219,34 +186,16 @@ class ActivationSteerer:
             raise ValueError("Steering vector not computed! Run compute_steering_vector first.")
         if max_length is None:
             max_length = self.max_length
-            padding = True
-        else:
-            padding = "max_length"
         if alpha !=0.0:   # 对中间向量进行干预
             print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
             # inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
-            print(inputs.input_ids.shape)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
             # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
             vec_base = (self.steering_vector * alpha).to(self.model.dtype)
 
             def adapter_hook(module, args, output):
                 h = output[0] if isinstance(output, tuple) else output
                 seq_len = h.shape[1]
-                # 新增监控norm的逻辑
-                # --- 新增监控逻辑 ---
-                with torch.no_grad():
-                    # 计算当前 Batch 最后一个 token 的原始范数 [B]
-                    orig_norm = torch.norm(h[:, -1, :], p=2, dim=-1).mean().item()
-                    orig_std = torch.norm(h[:, -1, :], p=2, dim=-1).std().item()
-                    # 计算干预项的范数
-                    steer_norm = torch.norm(vec_base, p=2, dim=-1).item()
-                    ratio = steer_norm / orig_norm if orig_norm != 0 else 0
-                    
-                    # 仅在 Prefill 阶段或第一个 Token 时打印，避免日志刷屏
-                    if seq_len > 1:
-                        print(f" > [Layer {self.layer_idx}] Norm Ratio: {ratio:.2%} (Orig: {orig_norm:.2f}, Steer: {steer_norm:.2f}), Orig Std: {orig_std:.2f}")
-                # ------------------ 判断是否干预 ------------------
                 
                 should_intervene = False
                 if intervention_mode == "static" and seq_len > 1:
@@ -260,7 +209,6 @@ class ActivationSteerer:
                     
                     # 直接加上我们计算好的差分向量
                     h[:, -1, :] = h[:, -1, :] + vec_inject
-                    # h[:, -1, :] = vec_inject
                     
                 return (h,) + output[1:] if isinstance(output, tuple) else h
 
@@ -269,10 +217,7 @@ class ActivationSteerer:
         else:
             print(f"\n[Steering] Alpha is 0.0, no intervention applied.")
             # inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
-            # print("=*20the inputs size is ")
-            # print(inputs.input_ids.shape)
-            # exit()
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
             handle = None
         
         self.model.eval()
@@ -298,10 +243,7 @@ class ActivationSteerer:
         """
         # laska 新增，初始化maxlength，避免不同padding长度带来的影响
         if max_length is None:
-            padding = True
             max_length = self.max_length
-        else:
-            padding = "max_length"
         # 1. 准备 Single 和 Repeat 两种 Prompt
         prompts_single = [p for p in prompts] # 这里的 p 已经是 build_prompts(repeat=False) 后的结果
         # 注意：这里需要重新 build 带有 repeat=True 的版本用于计算向量
@@ -319,23 +261,10 @@ class ActivationSteerer:
         h1 = self.extract_features(p_s, batch_size=len(p_s)) # [B, D]
         h2 = self.extract_features(p_r, batch_size=len(p_r)) # [B, D]
         
-        # 计算每一条数据自己的差分向量，未进行归一化的版本
-        # batch_diffs = (h2 - h1) * alpha # [B, D]
-        # batch_diffs = batch_diffs.to(self.model.dtype)
-        
-        # 计算差异
-        batch_diffs = h2 - h1 # [B, D]
-        # 新增的归一化操作
-        # 对每一行（每个样本）独立计算 L2 Norm
-        # keepdim=True 是为了后续的广播计算 [B, 1]
-        norms = torch.norm(batch_diffs, p=2, dim=-1, keepdim=True)
-        print("original norms:", norms.squeeze().tolist())  # 打印原始模长以供调试
+        # 计算每一条数据自己的差分向量
+        batch_diffs = (h2 - h1) * alpha # [B, D]
+        batch_diffs = batch_diffs.to(self.model.dtype)
 
-        # 避免除以 0
-        normalized_diffs = batch_diffs / (norms + 1e-8)
-        
-        # 最后应用 alpha 强度
-        batch_diffs = (normalized_diffs * alpha).to(self.model.dtype)
         # 3. 定义适配 Batch 的 Hook
         def instance_adapter_hook(module, args, output):
             h = output[0] if isinstance(output, tuple) else output
@@ -360,7 +289,7 @@ class ActivationSteerer:
 
         # 4. 执行推理
         # inputs = self.tokenizer(p_s, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
-        inputs = self.tokenizer(p_s, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+        inputs = self.tokenizer(p_s, return_tensors="pt", padding="max_length", truncation=True, max_length=max_length).to(self.device)
         layer_module = self._get_layer_module()
         handle = layer_module.register_forward_hook(instance_adapter_hook)
         
@@ -377,173 +306,10 @@ class ActivationSteerer:
             handle.remove()
             
         return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
-    
-    # 新增功能：Logit Lens 分析干预向量的语义信息
-    @torch.no_grad()
-    def analyze_steering_vector(self, top_k: int = 10):
-        """
-        使用 Logit Lens 技术将干预向量投影到词表空间，查看其包含的语义信息。
-        """
-        if self.steering_vector is None:
-            print("Error: No steering vector found. Please compute it first.")
-            return
-
-        # 1. 获取模型最后的归一化层和输出头
-        # 不同模型的命名不一致，这里做通用适配
-        if hasattr(self.model, "lm_head"):
-            lm_head = self.model.lm_head
-        elif hasattr(self.model.language_model, "lm_head"):
-            lm_head = self.model.language_model.lm_head
-        else:
-            raise AttributeError("Could not find lm_head in model.")
-
-        if hasattr(self.model, "model") and hasattr(self.model.model, "norm"): # Llama/Qwen
-            final_norm = self.model.model.norm
-        elif hasattr(self.model.language_model, "model") and hasattr(self.model.language_model.model, "norm"): # Gemma 3
-            final_norm = self.model.language_model.model.norm
-        else:
-            # 如果找不到，尝试直接搜索具有 LayerNorm/RMSNorm 类型的属性
-            final_norm = next((m for m in self.model.modules() if "Norm" in type(m).__name__), None)
-
-        # 2. 准备向量
-        # 将向量转为模型精度，并添加 Batch 维度 [1, D]
-        vec = self.steering_vector.to(device=self.model.device, dtype=self.model.dtype).unsqueeze(0)
-
-        # 3. 核心步骤：投影
-        # 重要：必须先经过模型最后的 LayerNorm/RMSNorm，否则分布会极度扭曲
-        if final_norm:
-            vec = final_norm(vec)
-        
-        # 投影到词表大小的 Logits 空间 [1, Vocab_Size]
-        logits = lm_head(vec)
-        
-        # 4. 获取 Top-K Token
-        probs = torch.softmax(logits, dim=-1)
-        top_values, top_indices = torch.topk(probs, top_k)
-        
-        top_values = top_values.squeeze().tolist()
-        top_indices = top_indices.squeeze().tolist()
-
-        print(f"\n=== Logit Lens Analysis (Top {top_k} Tokens) ===")
-        print(f"{'Token':<15} | {'Probability':<12}")
-        print("-" * 30)
-        for val, idx in zip(top_values, top_indices):
-            token_str = self.tokenizer.decode([idx]).strip()
-            # 转换一些不可见字符
-            token_str = token_str.replace("\n", "\\n")
-            print(f"{token_str:<15} | {val:.4%}")
-    
-    # 生成tsne降维图，展示不同题目类型的 Δh 分布情况
-    @torch.no_grad()
-    def analyze_delta_h_tsne(self, data_samples: List[dict], save_path: str = "tsne_distribution.png", label_key: str = None):
-        """
-        计算不同题目产生的 Δh，进行 t-SNE 降维并在本地保存空间分布图。
-        
-        Args:
-            data_samples: 题目样本列表。
-            save_path: 图片保存路径。
-            label_key: (可选) data_samples 中用于区分题目类型的 key (例如 'task_type' 或 'source')。
-                    如果提供，图表中的点将按类型着色。
-        """
-        N = len(data_samples)
-        if N < 5:
-            print("[Error] 样本数量太少（少于5个），无法进行有效的 t-SNE 分析。")
-            return
-
-        print(f"正在提取 {N} 个样本的独立 Δh 并进行 FP32 转换...")
-        
-        # 1. 提取隐状态并立即转为 FP32 (在 CPU 上计算降维，FP32 更稳健)
-        prompts_s = [build_prompts(x, self.tokenizer, repeat=False) for x in data_samples]
-        prompts_r = [build_prompts(x, self.tokenizer, repeat=True) for x in data_samples]
-        
-        # 获取隐状态 [N, D]
-        h_s = self.extract_features(prompts_s, batch_size=self.batch_size).cpu().float()
-        h_r = self.extract_features(prompts_r, batch_size=self.batch_size).cpu().float()
-        
-        # 2. 计算每个样本的独立 Δh 并进行 L2 归一化
-        # 归一化很重要，因为 t-SNE 基于距离，我们关心的是方向差异
-        deltas = h_r - h_s 
-        deltas_norm = F.normalize(deltas, p=2, dim=-1).numpy() # 转换为 NumPy 用于 sklearn
-        
-        # 3. 准备标签 (用于着色)
-        labels = []
-        if label_key and N > 0 and label_key in data_samples[0]:
-            labels = [x[label_key] for x in data_samples]
-            print(f" -> 已根据 '{label_key}' 提取标签用于着色。")
-        else:
-            labels = ["All Samples"] * N # 如果没有标签，使用统一颜色
-            print(" -> 未提供有效 label_key，所有点将使用统一颜色。")
-
-        # 4. 执行 t-SNE 降维
-        print(f"正在执行 t-SNE 降维 (维度: {deltas_norm.shape[1]} -> 2)...")
-        
-        # 参数调整建议：
-        # perplexity: 困惑度，考虑局部邻居的数量。样本少设小点(5-30)，样本多设大点(30-50)。
-        # random_state: 锁定随机种子，保证每次运行图形一致。
-        tsne_model = TSNE(
-            n_components=2, 
-            perplexity=min(30, N - 1), # 自动调整 perplexity
-            random_state=42, 
-            max_iter=1000, 
-            init='pca', # 使用 PCA 初始化能捕捉更好的全局结构
-            n_jobs=-1 # 使用所有 CPU 核心
-        )
-        
-        tsne_results = tsne_model.fit_transform(deltas_norm) # 结果形状 [N, 2]
-        
-        # 5. 使用 Pandas 和 Seaborn 绘图
-        print("正在生成分布图...")
-        df = pd.DataFrame({
-            'tsne_1': tsne_results[:, 0],
-            'tsne_2': tsne_results[:, 1],
-            'Type': labels
-        })
-        
-        plt.figure(figsize=(10, 8))
-        
-        # 根据是否有多种标签选择不同的绘图方式
-        if len(set(labels)) > 1:
-            scatter = sns.scatterplot(
-                data=df, 
-                x='tsne_1', y='tsne_2', 
-                hue='Type', # 按类型着色
-                style='Type', # 不同类型使用不同形状
-                palette='viridis', # 颜色盘
-                s=100, # 点的大小
-                alpha=0.8 # 透明度
-            )
-        else:
-            scatter = sns.scatterplot(
-                data=df, 
-                x='tsne_1', y='tsne_2', 
-                s=100, color='royalblue', alpha=0.7
-            )
-        
-        plt.title(f"t-SNE Visualization of Δh Distribution\n(Model: {self.model.config._name_or_path} | Layer: {self.layer_idx})", fontsize=14)
-        plt.xlabel("t-SNE Component 1", fontsize=12)
-        plt.ylabel("t-SNE Component 2", fontsize=12)
-        plt.grid(True, linestyle='--', alpha=0.5)
-        
-        # 防止图例遮挡图像
-        if len(set(labels)) > 1:
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0.)
-
-        # 6. 保存到本地
-        if save_path:
-            dir_name = os.path.dirname(save_path)
-            if dir_name:
-                os.makedirs(dir_name, exist_ok=True)
-            plt.savefig(save_path, bbox_inches='tight', dpi=300)
-            print(f" [Success] t-SNE 分布图已保存至: {os.path.abspath(save_path)}")
-        
-        plt.close()
-        
-        return tsne_results
 
 # ==========================================
 # 3. 主流程
 # ==========================================
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -563,7 +329,7 @@ def main():
     parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
     parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
     parser.add_argument("--repeat", default=False, action="store_true", help="是否对prompt进行重复，作为一个baseline")
-    parser.add_argument("--max_length", type=int, help="控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异")
+    parser.add_argument("--max_length", type=int, default=2048, help="控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异")
 
     args = parser.parse_args()
 
@@ -591,25 +357,13 @@ def main():
     print(f"Loading Model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
-    # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
     steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
 
     # 3. Compute Steering Vector (Zero-shot, No Labels Needed)
     # laska修改，某些情况下不需要进入这个函数 1. instance steering 模式下每个样例单独计算向量 2. alpha=0 的情况下不需要计算向量（虽然不计算向量也不会报错，但为了效率我们直接跳过）
     if (not args.instance_steering) and (args.alpha != 0.0):
         steerer.compute_steering_vector(calib_data)
-       
-        # 新增一个对干预向量进行分析的步骤
-        steerer.analyze_steering_vector(top_k=20)
-        # 动态生成文件名
-        tsne_file_name = f"analysis/tsne_layer{args.layer}_alpha{args.alpha}.png"
-        
-        # 调用分析，指定数据中用于着色的 key 为 'task_type'
-        steerer.analyze_delta_h_tsne(
-            calib_data, 
-            save_path=tsne_file_name
-        )
-            
+
     # 4. Inference on Test Set
     print(f"\n=== Starting Inference ===")
     os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
@@ -618,7 +372,6 @@ def main():
     correct_count = 0
     total_count = 0
     pbar = tqdm(total=len(test_data), desc="Evaluating")
-    
     
     # 在 main() 中修改推理循环部分
     for i in range(0, len(test_data), args.eval_batch_size):
@@ -672,8 +425,6 @@ def main():
 
     pbar.close()
     print(f"\nDone! Final Accuracy: {correct_count/total_count:.2%}")
-
-   
 
 if __name__ == "__main__":
     main()
