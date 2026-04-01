@@ -3,3 +3,6 @@ results/
 tmp/
 **/.ipynb_checkpoints/
 zero_shot_steering/static/
+logs/
+analysis/
+steering_report/

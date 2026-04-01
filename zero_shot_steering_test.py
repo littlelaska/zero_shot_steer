@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import json
 import argparse
 import os
@@ -70,9 +71,11 @@ def _format_options_from_ex(ex):
         return "Options:\n" + "\n".join([f"{k}) {v}" for k, v in opt_obj.items()])
     return ""
 
-def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False):
+def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_repeat=False):
     """
     构建 Prompt。如果 repeat=True，则应用论文中的 Query + Query 策略。
+    - repeat=True: 语义重复 Query + Query（论文里的 Prompt Repetition）。
+    - pad_repeat=True: 用 pad 字符把 token 长度扩到约 2 倍（语义不变），用于和 repeat 对比。
     """
     ctx = ex.get("context", "")
     q = ex.get("question", "")
@@ -83,13 +86,18 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False):
     if reverse_context:
         base_query = f"Question:\n{q}\n\n{opts}\n\nContext:\n{ctx}\n\n"
     
+    # 情况 1：重复语义的 Query + Query
     # 核心：复现论文的 Prompt Repetition
-    if repeat:
+    if repeat and not pad_repeat:
         # 你也可以在这里尝试论文里的变体：base_query + "\n\nLet me repeat that:\n\n" + base_query
         user_content = base_query + base_query + tail_prompt
     else:
         user_content = base_query + tail_prompt
     
+    # 注意：
+    # pad_repeat 产生“真正的 pad token（attention_mask=0）”应在 tokenizer 编码阶段用 padding='max_length' 实现，
+    # 而不是在文本层面追加任何字符。这里保留参数仅用于上层逻辑分支。
+
     if tokenizer and hasattr(tokenizer, "apply_chat_template"):
         try:
             return tokenizer.apply_chat_template([
@@ -211,7 +219,70 @@ class ActivationSteerer:
         print(f"[Steering] Vector computed. L2 Norm: {torch.norm(self.steering_vector):.4f}")
         return self.steering_vector
 
-    def generate_with_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static", max_length: int = None):
+    def _tokenize_pad_repeat(self, prompts: List[str], pad_factor: int, truncation_max_length: int):
+        """
+        先获取每条样本在不 padding 下的长度，再用 padding='max_length' 补齐到 pad_factor 倍长度。
+        这样补出来的 token 会满足 attention_mask==0，可用于统计“额外 pad token”比例。
+        """
+        if self.tokenizer.pad_token_id is None:
+            # 与 __init__ 保持一致：若无 pad_token，用 eos 兜底
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        pad_id = self.tokenizer.pad_token_id
+        assert pad_id is not None
+
+        input_ids_list = []
+        attn_list = []
+        max_L = 0
+
+        for p in prompts:
+            # 不 padding 的真实长度（仍按 truncation_max_length 截断）
+            ids = self.tokenizer(
+                p,
+                add_special_tokens=False,
+                padding=False,
+                truncation=True,
+                max_length=truncation_max_length,
+            )["input_ids"]
+            real_len = len(ids)
+            target_len = max(1, pad_factor * real_len)
+            if truncation_max_length is not None:
+                target_len = min(target_len, truncation_max_length)
+
+            enc = self.tokenizer(
+                p,
+                return_tensors="pt",
+                add_special_tokens=False,
+                padding="max_length",
+                truncation=True,
+                max_length=target_len,
+            )
+            input_ids = enc["input_ids"][0]
+            attn = enc["attention_mask"][0]
+
+            input_ids_list.append(input_ids)
+            attn_list.append(attn)
+            max_L = max(max_L, int(input_ids.shape[0]))
+
+        # batch 内再 pad 到同一个 max_L（也是 pad token, attention_mask=0）
+        batch_input_ids = torch.full((len(prompts), max_L), pad_id, dtype=torch.long)
+        batch_attn = torch.zeros((len(prompts), max_L), dtype=torch.long)
+        for i, (ids, attn) in enumerate(zip(input_ids_list, attn_list)):
+            L = int(ids.shape[0])
+            batch_input_ids[i, -L:] = ids  # 保持 left padding 习惯
+            batch_attn[i, -L:] = attn
+
+        return {"input_ids": batch_input_ids.to(self.device), "attention_mask": batch_attn.to(self.device)}
+
+    def generate_with_steering(
+        self,
+        prompts: List[str],
+        alpha: float = 1.0,
+        intervention_mode: str = "static",
+        max_length: int = None,
+        pad_repeat: bool = False,
+        pad_factor: int = 2,
+    ):
         """
         Step 4: 将向量注入到残差流进行干预
         """
@@ -222,10 +293,12 @@ class ActivationSteerer:
             padding = True
         else:
             padding = "max_length"
-        if alpha !=0.0:   # 对中间向量进行干预
+        if alpha != 0.0:   # 对中间向量进行干预
             print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
-            # inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            if pad_repeat:
+                inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
+            else:
+                inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
             print(inputs.input_ids.shape)
             # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
             vec_base = (self.steering_vector * alpha).to(self.model.dtype)
@@ -268,8 +341,47 @@ class ActivationSteerer:
             handle = layer_module.register_forward_hook(adapter_hook)
         else:
             print(f"\n[Steering] Alpha is 0.0, no intervention applied.")
-            # inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=8192).to(self.device)
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            if pad_repeat:
+                inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
+            else:
+                inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            # ========= 统计本 batch 的 pad 比例（仅统计“batch padding”产生的 pad token）=========
+            # 说明：
+            # - attention_mask==0 的位置才是 tokenizer 自动补的 pad（batch 对齐 / max_length 对齐）
+            # - 若启用 pad_repeat，这里的 pad_len 会包含“补齐到 pad_factor 倍长度”产生的 pad token
+            with torch.no_grad():
+                input_ids = inputs["input_ids"]
+                attn = inputs["attention_mask"]
+                B, L = input_ids.shape
+
+                # 1) 基于 attention_mask 统计真正的 tokenizer padding 数量
+                real_len = attn.sum(dim=-1)                 # [B]
+                pad_len = (attn == 0).sum(dim=-1)           # [B]
+
+                # 2) 额外诊断：不做 padding 时每条样本的长度（已 truncation 到 max_length）
+                #    用于判断 pad_len==0 是因为“长度本来就一样”，还是因为“全部被截断到同一长度”
+                no_pad = self.tokenizer(
+                    prompts,
+                    return_tensors=None,
+                    padding=False,
+                    truncation=True,
+                    max_length=max_length,
+                )
+                no_pad_lens = torch.tensor([len(x) for x in no_pad["input_ids"]], device=attn.device)  # [B]
+
+                pad_real_ratio = pad_len.float() / (no_pad_lens.float() + 1e-8)
+                pad_total_ratio = pad_len.float() / float(L)
+
+                any_truncated = (no_pad_lens == max_length).any().item() if max_length is not None else False
+                frac_truncated = (no_pad_lens == max_length).float().mean().item() if max_length is not None else 0.0
+
+                print(f"[Padding Stats] Batch size={B}, padded_seq_len(L)={L}, max_length={max_length}")
+                print(f"  no_pad_len(min/mean/max) = {no_pad_lens.min().item():.0f} / {no_pad_lens.float().mean().item():.2f} / {no_pad_lens.max().item():.0f}")
+                print(f"  pad_len  (min/mean/max)  = {pad_len.min().item():.0f} / {pad_len.float().mean().item():.2f} / {pad_len.max().item():.0f}")
+                print(f"  mean_pad/real            = {pad_real_ratio.mean().item():.4f}")
+                print(f"  mean_pad/total           = {pad_total_ratio.mean().item():.4f}")
+                print(f"  truncated_any={bool(any_truncated)} truncated_frac={frac_truncated:.2%}")
+            # ====================================================================
             # print("=*20the inputs size is ")
             # print(inputs.input_ids.shape)
             # exit()
@@ -563,7 +675,12 @@ def main():
     parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
     parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
     parser.add_argument("--repeat", default=False, action="store_true", help="是否对prompt进行重复，作为一个baseline")
+    parser.add_argument("--pad_repeat", default=False, action="store_true", help="是否使用pad字符把长度扩展到约2倍，作为对照baseline")
+    parser.add_argument("--pad_factor", type=int, default=2, help="pad_repeat 时补齐倍率（默认 2 倍）")
     parser.add_argument("--max_length", type=int, help="控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异")
+    parser.add_argument("--dataset", type=str, default="LogicalDeduction", help="当前测试的数据集名称，用于分析和命名输出文件")
+    # 新增一个，选取部分数据用于测试
+    parser.add_argument("--max_test_samples", type=int, default = 1000, help="如果指定，则仅使用前 N 条测试数据进行推理")
 
     args = parser.parse_args()
 
@@ -577,7 +694,7 @@ def main():
     if not args.instance_steering and args.alpha != 0.0:
         print(f"Loading calibration data from {args.calib_file} (max {args.calib_samples} samples)...")
         calib_data = load_data_file(args.calib_file, max_n=args.calib_samples)
-    test_data = load_data_file(args.test_file, max_n=None)
+    test_data = load_data_file(args.test_file, max_n=args.max_test_samples)
     
     if not args.instance_steering and args.alpha != 0.0:
         if not calib_data:
@@ -589,7 +706,7 @@ def main():
 
     # 2. Load Model
     print(f"Loading Model...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
     model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
     # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
     steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
@@ -602,7 +719,7 @@ def main():
         # 新增一个对干预向量进行分析的步骤
         steerer.analyze_steering_vector(top_k=20)
         # 动态生成文件名
-        tsne_file_name = f"analysis/tsne_layer{args.layer}_alpha{args.alpha}.png"
+        tsne_file_name = f"analysis/{args.dataset}_tsne_layer{args.layer}_alpha{args.alpha}.png"
         
         # 调用分析，指定数据中用于着色的 key 为 'task_type'
         steerer.analyze_delta_h_tsne(
@@ -634,19 +751,35 @@ def main():
             )
         else:
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)
-            # baseline的单个prompt、reverse以及重复prompt将在这个分支中进行计算
-            if args.repeat:   # 对prompt进行重复计算，作为一个baseline
-                batch_prompts = [build_prompts(x, tokenizer, repeat=True) for x in batch_ex]
+            # baseline 的单个 prompt、reverse、repeat、pad_repeat 都在这里处理
+            if args.repeat and not args.pad_repeat:   # 对prompt进行重复计算，作为一个baseline
+                # 语义重复 baseline
+                batch_prompts = [
+                    build_prompts(x, tokenizer, repeat=True, reverse_context=False, pad_repeat=False)
+                    for x in batch_ex
+                ]
                 # print(f"Batch Prompts Example (Repeat):\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
                 # exit()
+            elif args.pad_repeat:
+                # 仅用 pad 字符扩长的 baseline（语义不变）
+                batch_prompts = [
+                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=True)
+                    for x in batch_ex
+                ]
             else:     # 其他情况（包括reverse）仍然使用原来的构建方式
-                batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex]
+                # 普通 / reverse baseline
+                batch_prompts = [
+                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=False)
+                    for x in batch_ex
+                ]
                 # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
                 # exit()
             batch_outputs = steerer.generate_with_steering(
                 batch_prompts, 
                 alpha=args.alpha, 
-                intervention_mode=args.intervention_mode
+                intervention_mode=args.intervention_mode,
+                pad_repeat=args.pad_repeat,
+                pad_factor=args.pad_factor,
             )
         # --- 剩下的保存逻辑不变 ---
         # batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
@@ -672,8 +805,6 @@ def main():
 
     pbar.close()
     print(f"\nDone! Final Accuracy: {correct_count/total_count:.2%}")
-
-   
 
 if __name__ == "__main__":
     main()

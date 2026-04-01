@@ -564,6 +564,7 @@ def main():
     parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
     parser.add_argument("--repeat", default=False, action="store_true", help="是否对prompt进行重复，作为一个baseline")
     parser.add_argument("--max_length", type=int, help="控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异")
+    parser.add_argument("--dataset", type=str, default="LogicalDeduction", help="当前测试的数据集名称，用于分析和命名输出文件")
 
     args = parser.parse_args()
 
@@ -602,7 +603,7 @@ def main():
         # 新增一个对干预向量进行分析的步骤
         steerer.analyze_steering_vector(top_k=20)
         # 动态生成文件名
-        tsne_file_name = f"analysis/tsne_layer{args.layer}_alpha{args.alpha}.png"
+        tsne_file_name = f"analysis/{args.dataset}_tsne_layer{args.layer}_alpha{args.alpha}.png"
         
         # 调用分析，指定数据中用于着色的 key 为 'task_type'
         steerer.analyze_delta_h_tsne(
