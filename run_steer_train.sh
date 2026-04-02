@@ -1,6 +1,6 @@
 #!/bin/bash
 
-GPU=0,7
+GPU=0,3
 export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
@@ -21,7 +21,7 @@ CONTEXT_REVERSE=true         # 用于将context放在question和option之后
 EVAL_BATCH_SIZE=16           # 控制测试时的batch_size大小
 INSTANCE_STEERING=false       # 控制干预向量是单个还是一致的
 # MAX_LENGTH=1024               # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
-MAX_TEST_SAMPLES=10           # 控制测试时的样本数量，避免测试时间过长（你可以根据需要调整这个值，或者设置为 None 来使用全部样本）
+# MAX_TEST_SAMPLES=10           # 控制测试时的样本数量，避免测试时间过长（你可以根据需要调整这个值，或者设置为 None 来使用全部样本）
 
 # ================= 路径准备 =================
 # 构造新的输出文件夹路径
