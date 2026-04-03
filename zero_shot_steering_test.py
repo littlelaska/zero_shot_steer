@@ -712,7 +712,7 @@ def main():
     parser.add_argument("--max_test_samples", type=int, default = 1000, help="如果指定，则仅使用前 N 条测试数据进行推理")
     # vLLM：仅用于无 steer 的 baseline（alpha=0），与 HF 路径共用同一套 build_prompts
     parser.add_argument("--use_vllm", action="store_true", help="使用 vLLM 推理（仅支持 alpha=0、非 instance_steering；不支持 pad_repeat）")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.3, help="vLLM gpu_memory_utilization")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="vLLM gpu_memory_utilization")
     parser.add_argument("--vllm_max_model_len", type=int, default=None, help="可选，传给 vLLM 的 max_model_len")
     parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="vLLM tensor_parallel_size")
 
@@ -817,16 +817,16 @@ def main():
                 ]
                 # print(f"Batch Prompts Example (Repeat):\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
                 # exit()
-            elif args.pad_repeat:
-                # 仅用 pad 字符扩长的 baseline（语义不变）
-                batch_prompts = [
-                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=True)
-                    for x in batch_ex
-                ]
+            # elif args.pad_repeat:
+            #     # 仅用 pad 字符扩长的 baseline（语义不变）
+            #     batch_prompts = [
+            #         build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=True)
+            #         for x in batch_ex
+            #     ]
             else:     # 其他情况（包括reverse）仍然使用原来的构建方式
                 # 普通 / reverse baseline
                 batch_prompts = [
-                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=False)
+                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=args.pad_repeat)
                     for x in batch_ex
                 ]
                 # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
