@@ -97,6 +97,26 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_r
     # 注意：
     # pad_repeat 产生“真正的 pad token（attention_mask=0）”应在 tokenizer 编码阶段用 padding='max_length' 实现，
     # 而不是在文本层面追加任何字符。这里保留参数仅用于上层逻辑分支。
+    # 20260403 新增用pad_token在text前面pad，用于vllm测试
+    # 情况 2：仅用 pad 字符把长度扩到约 2 倍（不引入新语义）
+    if pad_repeat and tokenizer is not None:
+        # 优先用 tokenizer.pad_token，否则退化为 eos_token，再否则用空格
+        pad_token_text = tokenizer.pad_token or tokenizer.eos_token or " "
+        # 当前 token 数
+        tokens = tokenizer(user_content, add_special_tokens=False).input_ids
+        cur_len = len(tokens)
+        target_len = cur_len * 2
+        pad_text = ""
+        # 逐步在文本末首追加 pad_token_text，直到 token 数 >= 2 * cur_len
+        while True:
+            tmp_tokens = tokenizer(
+                pad_text + pad_token_text + user_content,
+                add_special_tokens=False
+            ).input_ids
+            if len(tmp_tokens) >= target_len:
+                break
+            pad_text += pad_token_text
+        user_content = pad_text + user_content
 
     if tokenizer and hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -341,10 +361,11 @@ class ActivationSteerer:
             handle = layer_module.register_forward_hook(adapter_hook)
         else:
             print(f"\n[Steering] Alpha is 0.0, no intervention applied.")
-            if pad_repeat:
-                inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
-            else:
-                inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            # if pad_repeat:
+            #     inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
+            # else:
+                # inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
             # ========= 统计本 batch 的 pad 比例（仅统计“batch padding”产生的 pad token）=========
             # 说明：
             # - attention_mask==0 的位置才是 tokenizer 自动补的 pad（batch 对齐 / max_length 对齐）
@@ -702,8 +723,8 @@ def main():
             raise SystemExit("--use_vllm 仅支持无干预 baseline，请设 --alpha 0.0")
         if args.instance_steering:
             raise SystemExit("--use_vllm 与 --instance_steering 不兼容（实例级 steer 需 HF forward hook）")
-        if args.pad_repeat:
-            raise SystemExit("--use_vllm 暂不支持 --pad_repeat（需与 HF 一致的 pad token 编码）")
+        # if args.pad_repeat:
+        #     raise SystemExit("--use_vllm 暂不支持 --pad_repeat（需与 HF 一致的 pad token 编码）")
 
     print(f"=== Zero-shot Steering PoC ===")
     print(f"Model: {args.model}")
@@ -820,8 +841,6 @@ def main():
                     pad_repeat=args.pad_repeat,
                     pad_factor=args.pad_factor,
                 )
-        # --- 剩下的保存逻辑不变 ---
-        # batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
 
         with open(args.output_file, "a", encoding="utf-8") as f:
             for j, output_text in enumerate(batch_outputs):

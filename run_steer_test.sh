@@ -137,14 +137,20 @@ echo "RUN_CMD: ${REPEAT_CMD}"
 echo "--------------------------------------------------"
 ${REPEAT_CMD}
 
-# # 0331新增，新增一个用pad进行prompt重复的baseline
-# echo "--------------------------------------------------"
-# echo "Running Padding Token Repeat Baseline (No Intervention, Alpha=0.0)"
-# echo "--------------------------------------------------"
-# PAD_REPEAT_CMD="$REPEAT_CMD --alpha 0.0 --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
-# echo "RUN_CMD: ${PAD_REPEAT_CMD}"
-# echo "--------------------------------------------------"
-# ${PAD_REPEAT_CMD}
+# 0331新增，新增一个用pad进行prompt重复的baseline
+echo "--------------------------------------------------"
+echo "Running Padding Token Repeat Baseline (No Intervention, Alpha=0.0)"
+echo "--------------------------------------------------"
+PAD_REPEAT_CMD="$REPEAT_CMD --alpha 0.0 --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
+if [ "$USE_VLLM" = true ]; then
+  PAD_REPEAT_CMD="$PAD_REPEAT_CMD --use_vllm"
+  if [ -n "$VLLM_MAX_MODEL_LEN" ]; then
+    PAD_REPEAT_CMD="$PAD_REPEAT_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
+  fi
+fi
+echo "RUN_CMD: ${PAD_REPEAT_CMD}"
+echo "--------------------------------------------------"
+${PAD_REPEAT_CMD}
 
 # # 是否对单个样例实施定制化的干预
 # if [ "$INSTANCE_STEERING" = true ]; then
