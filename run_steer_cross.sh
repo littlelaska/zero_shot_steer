@@ -10,8 +10,8 @@ MODEL_NAME=$(basename "$MODEL_PATH")
 
 # 2. 实验参数 (Zero-shot Steering)
 # 因为是零样本干预，我们不再需要区分 SOURCE，直接在特定数据集上验证
-TEST_DATASET="AR-LSAT"  # 当前要进行测试的目标域数据集
-TRAIN_DATASET="FOLIO"  # 用于抽取delta_h的校准数据集，通常和测试数据集相同（零样本干预），也可以换成其他数据集（比如 LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter）
+TEST_DATASET="FOLIO"  # 当前要进行测试的目标域数据集
+TRAIN_DATASET="ProofWriter"  # 用于抽取delta_h的校准数据集，通常和测试数据集相同（零样本干预），也可以换成其他数据集（比如 LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter）
 LAYERS="12 16 20 24"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 LAYERS="6 10 12 16 20 24 26"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层

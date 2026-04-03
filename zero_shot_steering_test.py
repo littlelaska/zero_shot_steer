@@ -656,6 +656,14 @@ class ActivationSteerer:
 # 3. 主流程
 # ==========================================
 
+def vllm_generate_batch(llm, prompts: List[str], max_new_tokens: int = 4096) -> List[str]:
+    """Greedy 解码，与 HF `do_sample=False` 对齐；仅返回新生成片段（与 HF 全序列 decode 在内容上通常等价于答案部分）。"""
+    from vllm import SamplingParams
+
+    sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
+    outputs = llm.generate(prompts, sampling_params)
+    return [out.outputs[0].text for out in outputs]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -681,8 +689,21 @@ def main():
     parser.add_argument("--dataset", type=str, default="LogicalDeduction", help="当前测试的数据集名称，用于分析和命名输出文件")
     # 新增一个，选取部分数据用于测试
     parser.add_argument("--max_test_samples", type=int, default = 1000, help="如果指定，则仅使用前 N 条测试数据进行推理")
+    # vLLM：仅用于无 steer 的 baseline（alpha=0），与 HF 路径共用同一套 build_prompts
+    parser.add_argument("--use_vllm", action="store_true", help="使用 vLLM 推理（仅支持 alpha=0、非 instance_steering；不支持 pad_repeat）")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.3, help="vLLM gpu_memory_utilization")
+    parser.add_argument("--vllm_max_model_len", type=int, default=None, help="可选，传给 vLLM 的 max_model_len")
+    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="vLLM tensor_parallel_size")
 
     args = parser.parse_args()
+
+    if args.use_vllm:
+        if args.alpha != 0.0:
+            raise SystemExit("--use_vllm 仅支持无干预 baseline，请设 --alpha 0.0")
+        if args.instance_steering:
+            raise SystemExit("--use_vllm 与 --instance_steering 不兼容（实例级 steer 需 HF forward hook）")
+        if args.pad_repeat:
+            raise SystemExit("--use_vllm 暂不支持 --pad_repeat（需与 HF 一致的 pad token 编码）")
 
     print(f"=== Zero-shot Steering PoC ===")
     print(f"Model: {args.model}")
@@ -707,13 +728,28 @@ def main():
     # 2. Load Model
     print(f"Loading Model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
-    # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
-    steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
+    llm = None
+    steerer = None
+    if args.use_vllm:
+        from vllm import LLM
+
+        llm_kw = dict(
+            model=args.model,
+            trust_remote_code=True,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            tensor_parallel_size=args.vllm_tensor_parallel_size,
+        )
+        if args.vllm_max_model_len is not None:
+            llm_kw["max_model_len"] = args.vllm_max_model_len
+        llm = LLM(**llm_kw)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
+        # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
+        steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
 
     # 3. Compute Steering Vector (Zero-shot, No Labels Needed)
     # laska修改，某些情况下不需要进入这个函数 1. instance steering 模式下每个样例单独计算向量 2. alpha=0 的情况下不需要计算向量（虽然不计算向量也不会报错，但为了效率我们直接跳过）
-    if (not args.instance_steering) and (args.alpha != 0.0):
+    if (not args.use_vllm) and (not args.instance_steering) and (args.alpha != 0.0):
         steerer.compute_steering_vector(calib_data)
        
         # 新增一个对干预向量进行分析的步骤
@@ -774,13 +810,16 @@ def main():
                 ]
                 # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
                 # exit()
-            batch_outputs = steerer.generate_with_steering(
-                batch_prompts, 
-                alpha=args.alpha, 
-                intervention_mode=args.intervention_mode,
-                pad_repeat=args.pad_repeat,
-                pad_factor=args.pad_factor,
-            )
+            if args.use_vllm:
+                batch_outputs = vllm_generate_batch(llm, batch_prompts)
+            else:
+                batch_outputs = steerer.generate_with_steering(
+                    batch_prompts, 
+                    alpha=args.alpha, 
+                    intervention_mode=args.intervention_mode,
+                    pad_repeat=args.pad_repeat,
+                    pad_factor=args.pad_factor,
+                )
         # --- 剩下的保存逻辑不变 ---
         # batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
 

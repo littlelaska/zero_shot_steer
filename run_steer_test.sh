@@ -1,24 +1,27 @@
 #!/bin/bash
 
-GPU=6,7
+GPU=0,7
 export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
 # 1. 模型绝对路径
-MODEL_PATH="/data_a100/models/Qwen2.5-7B-Instruct"
+MODEL_PATH="/data_a100/models/Qwen2.5-3B-Instruct"
 MODEL_NAME=$(basename "$MODEL_PATH")
 
 # 2. 实验参数 (Zero-shot Steering)
 # 因为是零样本干预，我们不再需要区分 SOURCE，直接在特定数据集上验证
-DATASET="FOLIO"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
+DATASET="LogicalDeduction"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
 LAYERS="12 16 20 24"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
 MODE="static"
 CALIB_SAMPLES=1000           # 用于提取 Δh 的无标签样本数量
 CONTEXT_REVERSE=true         # 用于将context放在question和option之后
-EVAL_BATCH_SIZE=8           # 控制测试时的batch_size大小
+EVAL_BATCH_SIZE=1000           # 控制测试时的batch_size大小
 INSTANCE_STEERING=false       # 控制干预向量是单个还是一致的
+# vLLM 无 steer baseline：仅对第一条 Baseline 命令生效；repeat/pad 仍走 HF（另起进程）
+USE_VLLM=true
+# VLLM_MAX_MODEL_LEN=8192      # 可选，传给 --vllm_max_model_len
 # MAX_LENGTH=1024               # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
 # MAX_TEST_SAMPLES=10           # 控制测试时的样本数量，避免测试时间过长（你可以根据需要调整这个值，或者设置为 None 来使用全部样本）
 
@@ -98,6 +101,12 @@ echo "--------------------------------------------------"
 echo "Running Baseline (No Intervention, Alpha=0.0)"
 echo "--------------------------------------------------"
 BASELINE_CMD="$RUN_CMD --alpha 0.0 --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_baseline_alpha_0.0.jsonl"
+if [ "$USE_VLLM" = true ]; then
+  BASELINE_CMD="$BASELINE_CMD --use_vllm"
+  if [ -n "$VLLM_MAX_MODEL_LEN" ]; then
+    BASELINE_CMD="$BASELINE_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
+  fi
+fi
 echo "RUN_CMD: ${BASELINE_CMD}"
 echo "--------------------------------------------------"
 ${BASELINE_CMD}
@@ -118,18 +127,24 @@ echo "--------------------------------------------------"
 echo "Running Prompt Repeat Baseline (No Intervention, Alpha=0.0)"
 echo "--------------------------------------------------"
 REPEAT_CMD="$REPEAT_CMD --alpha 0.0 --repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_repeat_baseline_alpha_0.0.jsonl"
+if [ "$USE_VLLM" = true ]; then
+  REPEAT_CMD="$REPEAT_CMD --use_vllm"
+  if [ -n "$VLLM_MAX_MODEL_LEN" ]; then
+    REPEAT_CMD="$REPEAT_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
+  fi
+fi
 echo "RUN_CMD: ${REPEAT_CMD}"
 echo "--------------------------------------------------"
 ${REPEAT_CMD}
 
-# 0331新增，新增一个用pad进行prompt重复的baseline
-echo "--------------------------------------------------"
-echo "Running Padding Token Repeat Baseline (No Intervention, Alpha=0.0)"
-echo "--------------------------------------------------"
-PAD_REPEAT_CMD="$REPEAT_CMD --alpha 0.0 --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
-echo "RUN_CMD: ${PAD_REPEAT_CMD}"
-echo "--------------------------------------------------"
-${PAD_REPEAT_CMD}
+# # 0331新增，新增一个用pad进行prompt重复的baseline
+# echo "--------------------------------------------------"
+# echo "Running Padding Token Repeat Baseline (No Intervention, Alpha=0.0)"
+# echo "--------------------------------------------------"
+# PAD_REPEAT_CMD="$REPEAT_CMD --alpha 0.0 --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
+# echo "RUN_CMD: ${PAD_REPEAT_CMD}"
+# echo "--------------------------------------------------"
+# ${PAD_REPEAT_CMD}
 
 # # 是否对单个样例实施定制化的干预
 # if [ "$INSTANCE_STEERING" = true ]; then
