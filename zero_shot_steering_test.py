@@ -768,8 +768,8 @@ def main():
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)
             # baseline 的单个 prompt、reverse、repeat、pad_repeat 都在这里处理
             batch_prompts = [build_prompts(x,tokenizer,repeat=args.repeat,reverse_context=args.reverse_context,pad_repeat=args.pad_repeat) for x in batch_ex]
-                # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
-                # exit()
+            # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
+            # exit()
             if args.use_vllm:
                 batch_outputs = vllm_generate_batch(llm, batch_prompts)
             else:

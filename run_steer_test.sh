@@ -102,6 +102,7 @@ if [ "$USE_VLLM" = true ]; then
     if [ -n "$VLLM_MAX_MODEL_LEN" ]; then
       BASELINE_CMD_ORI="$BASELINE_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
       REPEAT_CMD="$REPEAT_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
+    fi
 fi
 
 # 先跑baseline的结果
