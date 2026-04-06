@@ -8,6 +8,7 @@ from tqdm import tqdm
 from typing import List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -94,29 +95,12 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_r
     else:
         user_content = base_query + tail_prompt
     
-    # 注意：
-    # pad_repeat 产生“真正的 pad token（attention_mask=0）”应在 tokenizer 编码阶段用 padding='max_length' 实现，
-    # 而不是在文本层面追加任何字符。这里保留参数仅用于上层逻辑分支。
-    # 20260403 新增用pad_token在text前面pad，用于vllm测试
-    # 情况 2：仅用 pad 字符把长度扩到约 2 倍（不引入新语义）
-    if pad_repeat and tokenizer is not None:
-        # 优先用 tokenizer.pad_token，否则退化为 eos_token，再否则用空格
-        pad_token_text = tokenizer.pad_token or tokenizer.eos_token or " "
-        # 当前 token 数
-        tokens = tokenizer(user_content, add_special_tokens=False).input_ids
-        cur_len = len(tokens)
-        target_len = cur_len * 2
-        pad_text = ""
-        # 逐步在文本末首追加 pad_token_text，直到 token 数 >= 2 * cur_len
-        while True:
-            tmp_tokens = tokenizer(
-                pad_text + pad_token_text + user_content,
-                add_special_tokens=False
-            ).input_ids
-            if len(tmp_tokens) >= target_len:
-                break
-            pad_text += pad_token_text
-        user_content = pad_text + user_content
+    # 情况2，pad_repeat：用 pad token 把输入扩展到约 2 倍长度，保持语义不变
+    # pad_repeat 需要考虑template的长度，
+    if pad_repeat and tokenizer:
+        token_count = len(tokenizer(user_content, add_special_tokens=False)["input_ids"])
+        pad_str = (tokenizer.pad_token or tokenizer.eos_token+" ") * token_count
+        user_content = pad_str + user_content
 
     if tokenizer and hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -254,44 +238,25 @@ class ActivationSteerer:
         input_ids_list = []
         attn_list = []
         max_L = 0
-
-        for p in prompts:
-            # 不 padding 的真实长度（仍按 truncation_max_length 截断）
-            ids = self.tokenizer(
-                p,
-                add_special_tokens=False,
-                padding=False,
-                truncation=True,
-                max_length=truncation_max_length,
-            )["input_ids"]
+        
+        for p in formatted:
+            ids = self.tokenizer(p, add_special_tokens=False, padding=False, truncation=True, max_length=self.max_length)["input_ids"]
             real_len = len(ids)
-            target_len = max(1, pad_factor * real_len)
-            if truncation_max_length is not None:
-                target_len = min(target_len, truncation_max_length)
-
-            enc = self.tokenizer(
-                p,
-                return_tensors="pt",
-                add_special_tokens=False,
-                padding="max_length",
-                truncation=True,
-                max_length=target_len,
-            )
-            input_ids = enc["input_ids"][0]
-            attn = enc["attention_mask"][0]
-
-            input_ids_list.append(input_ids)
-            attn_list.append(attn)
-            max_L = max(max_L, int(input_ids.shape[0]))
-
-        # batch 内再 pad 到同一个 max_L（也是 pad token, attention_mask=0）
-        batch_input_ids = torch.full((len(prompts), max_L), pad_id, dtype=torch.long)
-        batch_attn = torch.zeros((len(prompts), max_L), dtype=torch.long)
-        for i, (ids, attn) in enumerate(zip(input_ids_list, attn_list)):
-            L = int(ids.shape[0])
-            batch_input_ids[i, -L:] = ids  # 保持 left padding 习惯
-            batch_attn[i, -L:] = attn
-
+            # 计算需要补充的 pad 数量
+            max_len = min(real_len * pad_factor, truncation_max_length) # 确保至少是原长度
+            pad_len = max(0, max_len - real_len)
+            
+            # 直接通过列表拼接避免循环调用 tokenizer
+            new_ids = [pad_id] * pad_len + ids # 左填充
+            new_attn = [1] * len(new_ids) # 强制设置为 1，模拟计算开销
+            
+            input_ids_list.append(torch.tensor(new_ids))
+            attn_list.append(torch.tensor(new_attn))
+            
+        # Batch 对齐 
+        batch_input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
+        batch_attn = pad_sequence(attn_list, batch_first=True, padding_value=0)
+        
         return {"input_ids": batch_input_ids.to(self.device), "attention_mask": batch_attn.to(self.device)}
 
     def generate_with_steering(
@@ -315,10 +280,7 @@ class ActivationSteerer:
             padding = "max_length"
         if alpha != 0.0:   # 对中间向量进行干预
             print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
-            if pad_repeat:
-                inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
-            else:
-                inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
             print(inputs.input_ids.shape)
             # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
             vec_base = (self.steering_vector * alpha).to(self.model.dtype)
@@ -359,13 +321,12 @@ class ActivationSteerer:
 
             layer_module = self._get_layer_module()
             handle = layer_module.register_forward_hook(adapter_hook)
-        else:
+        else:   # alpha=0时，主要是跑baseline
             print(f"\n[Steering] Alpha is 0.0, no intervention applied.")
-            # if pad_repeat:
-            #     inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
-            # else:
-                # inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
-            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            if pad_repeat:
+                inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
+            else:
+                inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
             # ========= 统计本 batch 的 pad 比例（仅统计“batch padding”产生的 pad token）=========
             # 说明：
             # - attention_mask==0 的位置才是 tokenizer 自动补的 pad（batch 对齐 / max_length 对齐）
@@ -723,8 +684,6 @@ def main():
             raise SystemExit("--use_vllm 仅支持无干预 baseline，请设 --alpha 0.0")
         if args.instance_steering:
             raise SystemExit("--use_vllm 与 --instance_steering 不兼容（实例级 steer 需 HF forward hook）")
-        # if args.pad_repeat:
-        #     raise SystemExit("--use_vllm 暂不支持 --pad_repeat（需与 HF 一致的 pad token 编码）")
 
     print(f"=== Zero-shot Steering PoC ===")
     print(f"Model: {args.model}")
@@ -793,7 +752,6 @@ def main():
     total_count = 0
     pbar = tqdm(total=len(test_data), desc="Evaluating")
     
-    
     # 在 main() 中修改推理循环部分
     for i in range(0, len(test_data), args.eval_batch_size):
         batch_ex = test_data[i : i + args.eval_batch_size]
@@ -809,26 +767,7 @@ def main():
         else:
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)
             # baseline 的单个 prompt、reverse、repeat、pad_repeat 都在这里处理
-            if args.repeat and not args.pad_repeat:   # 对prompt进行重复计算，作为一个baseline
-                # 语义重复 baseline
-                batch_prompts = [
-                    build_prompts(x, tokenizer, repeat=True, reverse_context=False, pad_repeat=False)
-                    for x in batch_ex
-                ]
-                # print(f"Batch Prompts Example (Repeat):\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
-                # exit()
-            # elif args.pad_repeat:
-            #     # 仅用 pad 字符扩长的 baseline（语义不变）
-            #     batch_prompts = [
-            #         build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=True)
-            #         for x in batch_ex
-            #     ]
-            else:     # 其他情况（包括reverse）仍然使用原来的构建方式
-                # 普通 / reverse baseline
-                batch_prompts = [
-                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=args.pad_repeat)
-                    for x in batch_ex
-                ]
+            batch_prompts = [build_prompts(x,tokenizer,repeat=args.repeat,reverse_context=args.reverse_context,pad_repeat=args.pad_repeat) for x in batch_ex]
                 # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
                 # exit()
             if args.use_vllm:

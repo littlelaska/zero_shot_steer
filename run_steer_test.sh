@@ -119,7 +119,7 @@ echo "--------------------------------------------------"
 echo "Running Reverse Baseline (No Intervention, Alpha=0.0)"
 echo "--------------------------------------------------"
 if [ "$CONTEXT_REVERSE" = true ]; then
-  REVERSE_BASELINE_CMD="$BASELINEC_CMD_ORI --reverse_context --output_file ${OUT_DIR}/results_reverse_baseline_alpha_0.0.jsonl"
+  REVERSE_BASELINE_CMD="$BASELINE_CMD_ORI --reverse_context --output_file ${OUT_DIR}/results_reverse_baseline_alpha_0.0.jsonl"
   echo "RUN_CMD: ${REVERSE_BASELINE_CMD}"
   echo "--------------------------------------------------"
   ${REVERSE_BASELINE_CMD}
