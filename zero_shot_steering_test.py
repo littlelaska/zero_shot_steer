@@ -311,11 +311,29 @@ class ActivationSteerer:
 
                 if should_intervene:
                     # 【修改点】动态匹配当前层所在设备 (Dynamic device matching)
+                    # 1.确保设备匹配
                     vec_inject = vec_base.to(h.device)
                     
+                    # 2. 提取原始激活值及其L2范数，[Batch, Dim] -> [Batch, 1]
+                    # 使用 keepdim= True 保持维度以便后续广播
+                    orig_last_token = h[:, -1, :]
+                    orig_norm = torch.norm(orig_last_token, p=2, dim=-1, keepdim=True)  # [B, 1]
+
+                    # 3. 执行干预加法
                     # 直接加上我们计算好的差分向量
-                    h[:, -1, :] = h[:, -1, :] + vec_inject
+                    steered_last_token = orig_last_token + vec_inject
+                    
+                    # 4. 计算干预之后的范数
+                    steered_norm = torch.norm(steered_last_token, p=2, dim=-1, keepdim=True)  # [B, 1]
+
+                    # 5. 执行模长恢复：Scale = Original_Norm / Steered_Norm
+                    # 加入 1e-8 防止除以 0
+                    h[:, -1, :] = steered_last_token * (orig_norm / (steered_norm + 1e-8))
+                    # h[:, -1, :] = h[:, -1, :] + vec_inject
                     # h[:, -1, :] = vec_inject
+                    # (可选) 调试打印：检查比例是否恒定为 100%
+                    # print(f"Restored Norm Ratio: {torch.norm(h[:, -1, :], p=2, dim=-1).mean() / orig_norm.mean():.4f}")
+                    # exit()
                     
                 return (h,) + output[1:] if isinstance(output, tuple) else h
 
@@ -675,7 +693,6 @@ def main():
     parser.add_argument("--use_vllm", action="store_true", help="使用 vLLM 推理（仅支持 alpha=0、非 instance_steering；不支持 pad_repeat）")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="vLLM gpu_memory_utilization")
     parser.add_argument("--vllm_max_model_len", type=int, default=None, help="可选，传给 vLLM 的 max_model_len")
-    parser.add_argument("--vllm_tensor_parallel_size", type=int, default=1, help="vLLM tensor_parallel_size")
 
     args = parser.parse_args()
 
@@ -717,7 +734,7 @@ def main():
             model=args.model,
             trust_remote_code=True,
             gpu_memory_utilization=args.vllm_gpu_memory_utilization,
-            tensor_parallel_size=args.vllm_tensor_parallel_size,
+            tensor_parallel_size=torch.cuda.device_count(),
         )
         if args.vllm_max_model_len is not None:
             llm_kw["max_model_len"] = args.vllm_max_model_len
@@ -735,7 +752,8 @@ def main():
         # 新增一个对干预向量进行分析的步骤
         steerer.analyze_steering_vector(top_k=20)
         # 动态生成文件名
-        tsne_file_name = f"analysis/{args.dataset}_tsne_layer{args.layer}_alpha{args.alpha}.png"
+        model_name = args.model.split("/")[-1]  # 取模型名称的最后一部分
+        tsne_file_name = f"analysis/{args.dataset}_tsne_layer{args.layer}_{model_name}.png"
         
         # 调用分析，指定数据中用于着色的 key 为 'task_type'
         steerer.analyze_delta_h_tsne(

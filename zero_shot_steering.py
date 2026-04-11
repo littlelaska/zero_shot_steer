@@ -8,6 +8,7 @@ from tqdm import tqdm
 from typing import List
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
 import seaborn as sns
 import pandas as pd
@@ -94,9 +95,12 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_r
     else:
         user_content = base_query + tail_prompt
     
-    # 注意：
-    # pad_repeat 产生“真正的 pad token（attention_mask=0）”应在 tokenizer 编码阶段用 padding='max_length' 实现，
-    # 而不是在文本层面追加任何字符。这里保留参数仅用于上层逻辑分支。
+    # 情况2，pad_repeat：用 pad token 把输入扩展到约 2 倍长度，保持语义不变
+    # pad_repeat 需要考虑template的长度，
+    if pad_repeat and tokenizer:
+        token_count = len(tokenizer(user_content, add_special_tokens=False)["input_ids"])
+        pad_str = (tokenizer.pad_token or tokenizer.eos_token+" ") * token_count
+        user_content = pad_str + user_content
 
     if tokenizer and hasattr(tokenizer, "apply_chat_template"):
         try:
@@ -234,44 +238,25 @@ class ActivationSteerer:
         input_ids_list = []
         attn_list = []
         max_L = 0
-
-        for p in prompts:
-            # 不 padding 的真实长度（仍按 truncation_max_length 截断）
-            ids = self.tokenizer(
-                p,
-                add_special_tokens=False,
-                padding=False,
-                truncation=True,
-                max_length=truncation_max_length,
-            )["input_ids"]
+        
+        for p in formatted:
+            ids = self.tokenizer(p, add_special_tokens=False, padding=False, truncation=True, max_length=self.max_length)["input_ids"]
             real_len = len(ids)
-            target_len = max(1, pad_factor * real_len)
-            if truncation_max_length is not None:
-                target_len = min(target_len, truncation_max_length)
-
-            enc = self.tokenizer(
-                p,
-                return_tensors="pt",
-                add_special_tokens=False,
-                padding="max_length",
-                truncation=True,
-                max_length=target_len,
-            )
-            input_ids = enc["input_ids"][0]
-            attn = enc["attention_mask"][0]
-
-            input_ids_list.append(input_ids)
-            attn_list.append(attn)
-            max_L = max(max_L, int(input_ids.shape[0]))
-
-        # batch 内再 pad 到同一个 max_L（也是 pad token, attention_mask=0）
-        batch_input_ids = torch.full((len(prompts), max_L), pad_id, dtype=torch.long)
-        batch_attn = torch.zeros((len(prompts), max_L), dtype=torch.long)
-        for i, (ids, attn) in enumerate(zip(input_ids_list, attn_list)):
-            L = int(ids.shape[0])
-            batch_input_ids[i, -L:] = ids  # 保持 left padding 习惯
-            batch_attn[i, -L:] = attn
-
+            # 计算需要补充的 pad 数量
+            max_len = min(real_len * pad_factor, truncation_max_length) # 确保至少是原长度
+            pad_len = max(0, max_len - real_len)
+            
+            # 直接通过列表拼接避免循环调用 tokenizer
+            new_ids = [pad_id] * pad_len + ids # 左填充
+            new_attn = [1] * len(new_ids) # 强制设置为 1，模拟计算开销
+            
+            input_ids_list.append(torch.tensor(new_ids))
+            attn_list.append(torch.tensor(new_attn))
+            
+        # Batch 对齐 
+        batch_input_ids = pad_sequence(input_ids_list, batch_first=True, padding_value=pad_id)
+        batch_attn = pad_sequence(attn_list, batch_first=True, padding_value=0)
+        
         return {"input_ids": batch_input_ids.to(self.device), "attention_mask": batch_attn.to(self.device)}
 
     def generate_with_steering(
@@ -295,10 +280,7 @@ class ActivationSteerer:
             padding = "max_length"
         if alpha != 0.0:   # 对中间向量进行干预
             print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
-            if pad_repeat:
-                inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
-            else:
-                inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
+            inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
             print(inputs.input_ids.shape)
             # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
             vec_base = (self.steering_vector * alpha).to(self.model.dtype)
@@ -329,17 +311,35 @@ class ActivationSteerer:
 
                 if should_intervene:
                     # 【修改点】动态匹配当前层所在设备 (Dynamic device matching)
+                    # 1.确保设备匹配
                     vec_inject = vec_base.to(h.device)
                     
+                    # 2. 提取原始激活值及其L2范数，[Batch, Dim] -> [Batch, 1]
+                    # 使用 keepdim= True 保持维度以便后续广播
+                    orig_last_token = h[:, -1, :]
+                    orig_norm = torch.norm(orig_last_token, p=2, dim=-1, keepdim=True)  # [B, 1]
+
+                    # 3. 执行干预加法
                     # 直接加上我们计算好的差分向量
-                    h[:, -1, :] = h[:, -1, :] + vec_inject
+                    steered_last_token = orig_last_token + vec_inject
+                    
+                    # 4. 计算干预之后的范数
+                    steered_norm = torch.norm(steered_last_token, p=2, dim=-1, keepdim=True)  # [B, 1]
+
+                    # 5. 执行模长恢复：Scale = Original_Norm / Steered_Norm
+                    # 加入 1e-8 防止除以 0
+                    h[:, -1, :] = steered_last_token * (orig_norm / (steered_norm + 1e-8))
+                    # h[:, -1, :] = h[:, -1, :] + vec_inject
                     # h[:, -1, :] = vec_inject
+                    # (可选) 调试打印：检查比例是否恒定为 100%
+                    # print(f"Restored Norm Ratio: {torch.norm(h[:, -1, :], p=2, dim=-1).mean() / orig_norm.mean():.4f}")
+                    # exit()
                     
                 return (h,) + output[1:] if isinstance(output, tuple) else h
 
             layer_module = self._get_layer_module()
             handle = layer_module.register_forward_hook(adapter_hook)
-        else:
+        else:   # alpha=0时，主要是跑baseline
             print(f"\n[Steering] Alpha is 0.0, no intervention applied.")
             if pad_repeat:
                 inputs = self._tokenize_pad_repeat(prompts, pad_factor=pad_factor, truncation_max_length=max_length)
@@ -656,6 +656,14 @@ class ActivationSteerer:
 # 3. 主流程
 # ==========================================
 
+def vllm_generate_batch(llm, prompts: List[str], max_new_tokens: int = 4096) -> List[str]:
+    """Greedy 解码，与 HF `do_sample=False` 对齐；仅返回新生成片段（与 HF 全序列 decode 在内容上通常等价于答案部分）。"""
+    from vllm import SamplingParams
+
+    sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
+    outputs = llm.generate(prompts, sampling_params)
+    return [out.outputs[0].text for out in outputs]
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -681,8 +689,18 @@ def main():
     parser.add_argument("--dataset", type=str, default="LogicalDeduction", help="当前测试的数据集名称，用于分析和命名输出文件")
     # 新增一个，选取部分数据用于测试
     parser.add_argument("--max_test_samples", type=int, default = 1000, help="如果指定，则仅使用前 N 条测试数据进行推理")
+    # vLLM：仅用于无 steer 的 baseline（alpha=0），与 HF 路径共用同一套 build_prompts
+    parser.add_argument("--use_vllm", action="store_true", help="使用 vLLM 推理（仅支持 alpha=0、非 instance_steering；不支持 pad_repeat）")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="vLLM gpu_memory_utilization")
+    parser.add_argument("--vllm_max_model_len", type=int, default=None, help="可选，传给 vLLM 的 max_model_len")
 
     args = parser.parse_args()
+
+    if args.use_vllm:
+        if args.alpha != 0.0:
+            raise SystemExit("--use_vllm 仅支持无干预 baseline，请设 --alpha 0.0")
+        if args.instance_steering:
+            raise SystemExit("--use_vllm 与 --instance_steering 不兼容（实例级 steer 需 HF forward hook）")
 
     print(f"=== Zero-shot Steering PoC ===")
     print(f"Model: {args.model}")
@@ -707,19 +725,35 @@ def main():
     # 2. Load Model
     print(f"Loading Model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, padding_side="left")
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
-    # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
-    steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
+    llm = None
+    steerer = None
+    if args.use_vllm:
+        from vllm import LLM
+
+        llm_kw = dict(
+            model=args.model,
+            trust_remote_code=True,
+            gpu_memory_utilization=args.vllm_gpu_memory_utilization,
+            tensor_parallel_size=torch.cuda.device_count(),
+        )
+        if args.vllm_max_model_len is not None:
+            llm_kw["max_model_len"] = args.vllm_max_model_len
+        llm = LLM(**llm_kw)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
+        # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
+        steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
 
     # 3. Compute Steering Vector (Zero-shot, No Labels Needed)
     # laska修改，某些情况下不需要进入这个函数 1. instance steering 模式下每个样例单独计算向量 2. alpha=0 的情况下不需要计算向量（虽然不计算向量也不会报错，但为了效率我们直接跳过）
-    if (not args.instance_steering) and (args.alpha != 0.0):
+    if (not args.use_vllm) and (not args.instance_steering) and (args.alpha != 0.0):
         steerer.compute_steering_vector(calib_data)
        
         # 新增一个对干预向量进行分析的步骤
         steerer.analyze_steering_vector(top_k=20)
         # 动态生成文件名
-        tsne_file_name = f"analysis/{args.dataset}_tsne_layer{args.layer}_alpha{args.alpha}.png"
+        model_name = args.model.split("/")[-1]  # 取模型名称的最后一部分
+        tsne_file_name = f"analysis/{args.dataset}_tsne_layer{args.layer}_{model_name}.png"
         
         # 调用分析，指定数据中用于着色的 key 为 'task_type'
         steerer.analyze_delta_h_tsne(
@@ -736,7 +770,6 @@ def main():
     total_count = 0
     pbar = tqdm(total=len(test_data), desc="Evaluating")
     
-    
     # 在 main() 中修改推理循环部分
     for i in range(0, len(test_data), args.eval_batch_size):
         batch_ex = test_data[i : i + args.eval_batch_size]
@@ -752,37 +785,19 @@ def main():
         else:
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)
             # baseline 的单个 prompt、reverse、repeat、pad_repeat 都在这里处理
-            if args.repeat and not args.pad_repeat:   # 对prompt进行重复计算，作为一个baseline
-                # 语义重复 baseline
-                batch_prompts = [
-                    build_prompts(x, tokenizer, repeat=True, reverse_context=False, pad_repeat=False)
-                    for x in batch_ex
-                ]
-                # print(f"Batch Prompts Example (Repeat):\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
-                # exit()
-            elif args.pad_repeat:
-                # 仅用 pad 字符扩长的 baseline（语义不变）
-                batch_prompts = [
-                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=True)
-                    for x in batch_ex
-                ]
-            else:     # 其他情况（包括reverse）仍然使用原来的构建方式
-                # 普通 / reverse baseline
-                batch_prompts = [
-                    build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context, pad_repeat=False)
-                    for x in batch_ex
-                ]
-                # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
-                # exit()
-            batch_outputs = steerer.generate_with_steering(
-                batch_prompts, 
-                alpha=args.alpha, 
-                intervention_mode=args.intervention_mode,
-                pad_repeat=args.pad_repeat,
-                pad_factor=args.pad_factor,
-            )
-        # --- 剩下的保存逻辑不变 ---
-        # batch_prompts = [build_prompts(x, tokenizer, repeat=False, reverse_context=args.reverse_context) for x in batch_ex] # 注意测试时是单次 Prompt!
+            batch_prompts = [build_prompts(x,tokenizer,repeat=args.repeat,reverse_context=args.reverse_context,pad_repeat=args.pad_repeat) for x in batch_ex]
+            # print(f"Batch Prompts Example:\n{batch_prompts[0]}...")  # 打印一个示例 Prompt 以供调试
+            # exit()
+            if args.use_vllm:
+                batch_outputs = vllm_generate_batch(llm, batch_prompts)
+            else:
+                batch_outputs = steerer.generate_with_steering(
+                    batch_prompts, 
+                    alpha=args.alpha, 
+                    intervention_mode=args.intervention_mode,
+                    pad_repeat=args.pad_repeat,
+                    pad_factor=args.pad_factor,
+                )
 
         with open(args.output_file, "a", encoding="utf-8") as f:
             for j, output_text in enumerate(batch_outputs):

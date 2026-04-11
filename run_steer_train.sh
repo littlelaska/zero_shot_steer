@@ -1,6 +1,6 @@
 #!/bin/bash
 
-GPU=0,3
+GPU=3
 export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
@@ -10,16 +10,18 @@ MODEL_NAME=$(basename "$MODEL_PATH")
 
 # 2. 实验参数 (Zero-shot Steering)
 # 因为是零样本干预，我们不再需要区分 SOURCE，直接在特定数据集上验证
-DATASET="LogicalDeduction"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
+DATASET="ProofWriter"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
 LAYERS="12 16 20 24"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
-LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
-# LAYERS="6 10 12 16 20 24 26"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
+LAYERS="6 10 12 16 20 24 26 30 34 38 40 42 44 46"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
 MODE="static"
 CALIB_SAMPLES=1000           # 用于提取 Δh 的无标签样本数量
 CONTEXT_REVERSE=true         # 用于将context放在question和option之后
 EVAL_BATCH_SIZE=16           # 控制测试时的batch_size大小
 INSTANCE_STEERING=false       # 控制干预向量是单个还是一致的
+# vLLM 无 steer baseline：仅对第一条 Baseline 命令生效；repeat/pad 仍走 HF（另起进程）
+USE_VLLM=true
+# VLLM_MAX_MODEL_LEN=8192      # 可选，传给 --vllm_max_model_len
 # MAX_LENGTH=1024               # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
 # MAX_TEST_SAMPLES=10           # 控制测试时的样本数量，避免测试时间过长（你可以根据需要调整这个值，或者设置为 None 来使用全部样本）
 
@@ -55,8 +57,8 @@ get_split_by_dataset() {
     "AR-LSAT")          echo "test" ;;
     "ProofWriter")      echo "test" ;;
     "FOLIO")            echo "dev" ;;
-    "LogicalDeduction") echo "dev" ;;  # 你没说明，这里默认 test
-    *)                  echo "test" ;;  # 默认值
+    "LogicalDeduction") echo "dev" ;;
+    *)                  echo "test" ;;
   esac
 }
 
@@ -66,7 +68,7 @@ test_split=$(get_split_by_dataset "$DATASET")
 CALIB_FILE="${BASE_DATA_DIR}/train.json"
 TEST_FILE="${BASE_DATA_DIR}/${test_split}.json"
 
-RUN_CMD="python zero_shot_steering_test.py \
+RUN_CMD="python zero_shot_steering.py \
             --dataset ${DATASET} \
             --calib_file ${CALIB_FILE} \
             --test_file ${TEST_FILE} \
@@ -75,7 +77,7 @@ RUN_CMD="python zero_shot_steering_test.py \
             --eval_batch_size ${EVAL_BATCH_SIZE} \
             --intervention_mode ${MODE}"
 
-# 在拼接 RUN_CMD 时，只有当 MAX_LENGTH 不是 None 时才添加该参数
+# 在拼接 RUN_CMD 时，只有当 MAX_TEST_SAMPLE 不是 None 时才添加该参数
 if [ "$MAX_TEST_SAMPLES" != "None" ] && [ -n "$MAX_TEST_SAMPLES" ]; then
     RUN_CMD="$RUN_CMD --max_test_samples $MAX_TEST_SAMPLES"
     REPEAT_CMD="$RUN_CMD --max_test_samples $MAX_TEST_SAMPLES"
@@ -93,32 +95,42 @@ else
     REPEAT_CMD="$RUN_CMD"
 fi
 
+# 20260403 提前进行baseline的vllm参数控制
+if [ "$USE_VLLM" = true ]; then
+    BASELINE_CMD_ORI="$RUN_CMD --alpha 0.0 --use_vllm"
+    REPEAT_CMD="$RUN_CMD --alpha 0.0 --use_vllm"
+    if [ -n "$VLLM_MAX_MODEL_LEN" ]; then
+      BASELINE_CMD_ORI="$BASELINE_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
+      REPEAT_CMD="$REPEAT_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
+    fi
+fi
+
 # 先跑baseline的结果
 # 跑一个 Baseline (alpha=0.0，不加干预) 用于对比
 echo "--------------------------------------------------"
 echo "Running Baseline (No Intervention, Alpha=0.0)"
 echo "--------------------------------------------------"
-BASELINE_CMD="$RUN_CMD --alpha 0.0 --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_baseline_alpha_0.0.jsonl"
+BASELINE_CMD="$BASELINE_CMD_ORI --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_baseline_alpha_0.0.jsonl"
 echo "RUN_CMD: ${BASELINE_CMD}"
 echo "--------------------------------------------------"
 ${BASELINE_CMD}
 
-# # laska修改，新增一个reverse的baseline
-# echo "--------------------------------------------------"
-# echo "Running Reverse Baseline (No Intervention, Alpha=0.0)"
-# echo "--------------------------------------------------"
-# if [ "$CONTEXT_REVERSE" = true ]; then
-#   REVERSE_BASELINE_CMD="$RUN_CMD --alpha 0.0 --reverse_context --output_file ${OUT_DIR}/results_reverse_baseline_alpha_0.0.jsonl"
-#   echo "RUN_CMD: ${REVERSE_BASELINE_CMD}"
-#   echo "--------------------------------------------------"
-#   ${REVERSE_BASELINE_CMD}
-# fi
+# laska修改，新增一个reverse的baseline
+echo "--------------------------------------------------"
+echo "Running Reverse Baseline (No Intervention, Alpha=0.0)"
+echo "--------------------------------------------------"
+if [ "$CONTEXT_REVERSE" = true ]; then
+  REVERSE_BASELINE_CMD="$BASELINE_CMD_ORI --reverse_context --output_file ${OUT_DIR}/results_reverse_baseline_alpha_0.0.jsonl"
+  echo "RUN_CMD: ${REVERSE_BASELINE_CMD}"
+  echo "--------------------------------------------------"
+  ${REVERSE_BASELINE_CMD}
+fi
 
 # laska修改，新增一个prompt repeat的baseline
 echo "--------------------------------------------------"
 echo "Running Prompt Repeat Baseline (No Intervention, Alpha=0.0)"
 echo "--------------------------------------------------"
-REPEAT_CMD="$REPEAT_CMD --alpha 0.0 --repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_repeat_baseline_alpha_0.0.jsonl"
+REPEAT_CMD="$REPEAT_CMD --repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_repeat_baseline_alpha_0.0.jsonl"
 echo "RUN_CMD: ${REPEAT_CMD}"
 echo "--------------------------------------------------"
 ${REPEAT_CMD}
@@ -127,7 +139,7 @@ ${REPEAT_CMD}
 echo "--------------------------------------------------"
 echo "Running Padding Token Repeat Baseline (No Intervention, Alpha=0.0)"
 echo "--------------------------------------------------"
-PAD_REPEAT_CMD="$REPEAT_CMD --alpha 0.0 --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
+PAD_REPEAT_CMD="$REPEAT_CMD --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
 echo "RUN_CMD: ${PAD_REPEAT_CMD}"
 echo "--------------------------------------------------"
 ${PAD_REPEAT_CMD}
@@ -156,7 +168,7 @@ do
         #   OUT_FILE="${OUT_DIR}/results_reverse_layer_${layer}_alpha_${alpha}.jsonl"
         # fi
         SUB_RUN_CMD="$RUN_CMD --layer ${layer} --alpha ${alpha} --output_file ${OUT_FILE}"
-
+        
         echo "--------------------------------------------------"
         echo "时间: $(date)"
         echo "Model: $MODEL_NAME | Dataset: $DATASET"
@@ -166,10 +178,10 @@ do
         echo "RUN_CMD: $SUB_RUN_CMD"
         echo "--------------------------------------------------"
         
-        #执行命令
+        # 执行命令
         ${SUB_RUN_CMD}
 
-        echo "Done: Layer $layer, Alpha $alpha"
+        echo "完成: Layer $layer, Alpha $alpha"
     done
 done
 
