@@ -5,19 +5,21 @@ export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
 # 1. 模型绝对路径
-MODEL_PATH="/data_a100/models/Qwen2.5-3B-Instruct"
+MODEL_PATH="/data_a100/models/Qwen2.5-7B-Instruct"
 MODEL_NAME=$(basename "$MODEL_PATH")
 
 # 2. 实验参数 (Zero-shot Steering)
 # 因为是零样本干预，我们不再需要区分 SOURCE，直接在特定数据集上验证
-DATASET="FOLIO"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
+DATASET="AR-LSAT"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
 LAYERS="12 16 20 24"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
-LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
+LAYERS="6 10 12 16 20 24 26 30 34 38 40 42 44 46"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
+LAYERS="6 10 12 16 20 24 26"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
+# LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
 MODE="static"
 CALIB_SAMPLES=1000           # 用于提取 Δh 的无标签样本数量
 CONTEXT_REVERSE=true         # 用于将context放在question和option之后
-EVAL_BATCH_SIZE=16          # 控制测试时的batch_size大小
+EVAL_BATCH_SIZE=16           # 控制测试时的batch_size大小
 INSTANCE_STEERING=false       # 控制干预向量是单个还是一致的
 # vLLM 无 steer baseline：仅对第一条 Baseline 命令生效；repeat/pad 仍走 HF（另起进程）
 USE_VLLM=true
@@ -68,7 +70,7 @@ test_split=$(get_split_by_dataset "$DATASET")
 CALIB_FILE="${BASE_DATA_DIR}/train.json"
 TEST_FILE="${BASE_DATA_DIR}/${test_split}.json"
 
-RUN_CMD="python zero_shot_steering_test.py \
+RUN_CMD="python zero_shot_steering.py \
             --dataset ${DATASET} \
             --calib_file ${CALIB_FILE} \
             --test_file ${TEST_FILE} \
@@ -144,14 +146,14 @@ fi
 # echo "--------------------------------------------------"
 # ${PAD_REPEAT_CMD}
 
-# # 是否对单个样例实施定制化的干预
-# if [ "$INSTANCE_STEERING" = true ]; then
-#   RUN_CMD="$RUN_CMD --instance_steering"
+# 是否对单个样例实施定制化的干预
+if [ "$INSTANCE_STEERING" = true ]; then
+  RUN_CMD="$RUN_CMD --instance_steering"
+fi
+# 是否将context放在question和option之后
+# if [ "$CONTEXT_REVERSE" = true ]; then
+#   RUN_CMD="$RUN_CMD --reverse_context"
 # fi
-# # 是否将context放在question和option之后
-# # if [ "$CONTEXT_REVERSE" = true ]; then
-# #   RUN_CMD="$RUN_CMD --reverse_context"
-# # fi
 
 # 按照layers和alphas的组合进行网格搜索
 # ================= 循环执行 =================
@@ -190,13 +192,13 @@ echo "实验全部结束: $(date)"
 echo "所有日志已保存至: ${LOG_FILE}"
 echo "=================================================="
 
-# # 实验结束后，自动生成 CSV 汇总和 PNG 趋势图
-# echo "--------------------------------------------------"
-# python collect_results.py --log_dir "./logs" --out_dir "./steering_report"
-# echo "--------------------------------------------------"
+# 实验结束后，自动生成 CSV 汇总和 PNG 趋势图
+echo "--------------------------------------------------"
+python collect_results.py --log_dir "./logs" --out_dir "./steering_report"
+echo "--------------------------------------------------"
 
-# # ... 在生成汇总表之后 ...
-# echo "Step 3: 正在生成性能提升热力图..."
-# python analyze_improvement.py \
-#     --csv "./steering_report/global_results.csv" \
-#     --out "./steering_report/improvement_visuals"
+# ... 在生成汇总表之后 ...
+echo "Step 3: 正在生成性能提升热力图..."
+python analyze_improvement.py \
+    --csv "./steering_report/global_results.csv" \
+    --out "./steering_report/improvement_visuals"

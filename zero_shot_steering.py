@@ -652,6 +652,104 @@ class ActivationSteerer:
         
         return tsne_results
 
+    @torch.no_grad()
+    def analyze_all_states_tsne(self, data_samples: List[dict], save_path: str = "tsne_trajectory.png", label_key: str = None):
+        """
+        绘制 h_s, h_r 和 Delta_h 的 t-SNE 分布，并用箭头连接每个样本的演进轨迹。
+        """
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+        import pandas as pd
+        import numpy as np
+        from sklearn.manifold import TSNE
+        import torch.nn.functional as F
+
+        N = len(data_samples)
+        if N < 5:
+            print("[Error] 样本数量太少，无法进行 t-SNE 分析。")
+            return
+
+        # 1. 提取表征 [cite: 279-301]
+        prompts_s = [build_prompts(x, repeat=False) for x in data_samples] # [cite: 85-114]
+        prompts_r = [build_prompts(x, repeat=True) for x in data_samples]  # [cite: 85-114]
+        
+        h_s = self.extract_features(prompts_s, batch_size=self.batch_size).cpu().float()
+        h_r = self.extract_features(prompts_r, batch_size=self.batch_size).cpu().float()
+        delta = h_r - h_s
+        
+        # 2. 拼接数据进行全局降维
+        # 顺序: [0:N] 是 h_s, [N:2N] 是 h_r, [2N:3N] 是 delta
+        combined_vectors = torch.cat([h_s, h_r, delta], dim=0)
+        combined_norm = F.normalize(combined_vectors, p=2, dim=-1).numpy()
+        
+        print(f"正在执行全局 t-SNE 降维 (总点数: {3*N})...")
+        tsne_model = TSNE(
+            n_components=2, 
+            perplexity=min(30, (3*N) - 1), 
+            random_state=42, 
+            init='pca', 
+            n_jobs=-1
+        )
+        tsne_results = tsne_model.fit_transform(combined_norm)
+        
+        # 3. 准备绘图数据
+        vector_types = ["Single_h_s"] * N + ["Repeat_h_r"] * N + ["Delta_h"] * N
+        task_labels = []
+        if label_key and label_key in data_samples[0]:
+            task_labels = [str(x[label_key]) for x in data_samples] * 3
+        else:
+            task_labels = ["Default"] * (3 * N)
+
+        df = pd.DataFrame({
+            'x': tsne_results[:, 0],
+            'y': tsne_results[:, 1],
+            'State': vector_types,
+            'Task': task_labels
+        })
+        
+        # 4. 绘图
+        plt.figure(figsize=(14, 11))
+        
+        # 绘制背景点
+        scatter = sns.scatterplot(
+            data=df, x='x', y='y', hue='State', 
+            style='Task' if len(set(task_labels)) > 1 else None,
+            palette={'Single_h_s': '#3498db', 'Repeat_h_r': '#e74c3c', 'Delta_h': '#2ecc71'},
+            s=120, alpha=0.8, edgecolor='w', zorder=3
+        )
+
+        # --- 核心改进：绘制演进连线 ---
+        print("正在绘制样本轨迹连线...")
+        for i in range(N):
+            # 从 h_s (索引 i) 指向 h_r (索引 N+i)
+            plt.annotate(
+                '', 
+                xy=(tsne_results[N + i, 0], tsne_results[N + i, 1]), 
+                xytext=(tsne_results[i, 0], tsne_results[i, 1]),
+                arrowprops=dict(
+                    arrowstyle='->', 
+                    color='gray', 
+                    lw=0.8, 
+                    alpha=0.3,
+                    shrinkA=5, shrinkB=5 # 稍微缩进，避免盖住点
+                ),
+                zorder=1 # 放在点下面
+            )
+        
+        # 5. 美化图表
+        plt.title(f"Latent Space Trajectory: $h_s \\rightarrow h_r$ (Layer: {self.layer_idx})\nArrows indicate the logical reasoning shift per sample", 
+                  fontsize=16, fontweight='bold', pad=20)
+        plt.xlabel("t-SNE Component 1", fontsize=12)
+        plt.ylabel("t-SNE Component 2", fontsize=12)
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.legend(bbox_to_anchor=(1.02, 1), loc='upper left', frameon=True, shadow=True)
+        
+        if save_path:
+            plt.savefig(save_path, bbox_inches='tight', dpi=300)
+            print(f" [Success] 轨迹图已保存: {save_path}")
+        
+        plt.close()
+        return tsne_results
 # ==========================================
 # 3. 主流程
 # ==========================================
@@ -756,7 +854,11 @@ def main():
         tsne_file_name = f"analysis/{args.dataset}_tsne_layer{args.layer}_{model_name}.png"
         
         # 调用分析，指定数据中用于着色的 key 为 'task_type'
-        steerer.analyze_delta_h_tsne(
+        # steerer.analyze_delta_h_tsne(
+        #     calib_data, 
+        #     save_path=tsne_file_name
+        # )
+        steerer.analyze_all_states_tsne(
             calib_data, 
             save_path=tsne_file_name
         )
