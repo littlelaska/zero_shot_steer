@@ -30,7 +30,7 @@ def _format_options_from_ex(ex):
 def build_prompts(ex, tokenizer=None, repeat=False):
     """同步论文中的 Query + Query 构造逻辑"""
     ctx = ex.get("context", "")
-    q = ex.get("question", "")
+    q = ex.get("question", "").lstrip("Question: ")   # 针对commonsense数据集需要去掉前面的question
     opts = _format_options_from_ex(ex)
     
     tail_prompt = "Please provide the reasoning and the answer."
@@ -102,7 +102,8 @@ class AlignedLayerAnalyzer:
             # 1. 构造 Single 和 Repeat 的文本
             text_s = build_prompts(ex, self.tokenizer, repeat=False)
             text_r = build_prompts(ex, self.tokenizer, repeat=True)
-            
+            # print("The repeat prompt is:\n", text_r)  # 打印重复构造的提示，便于调试
+
             # 2. 获取所有层的隐向量
             h_s = self.get_all_layer_last_token_states(text_s)
             h_r = self.get_all_layer_last_token_states(text_r)
