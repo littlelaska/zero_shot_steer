@@ -79,7 +79,7 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_r
     - pad_repeat=True: 用 pad 字符把 token 长度扩到约 2 倍（语义不变），用于和 repeat 对比。
     """
     ctx = ex.get("context", "")
-    q = ex.get("question", "")
+    q = ex.get("question", "").lstrip("Question: ")     # 针对commonsense数据集需要去掉前面的question
     opts = _format_options_from_ex(ex)
     
     tail_prompt = "Please provide the reasoning and the answer."

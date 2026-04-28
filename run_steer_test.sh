@@ -7,13 +7,15 @@ export CUDA_VISIBLE_DEVICES="${GPU}"
 # 1. 模型绝对路径
 MODEL_PATH="/data_a100/models/Qwen2.5-3B-Instruct"
 MODEL_NAME=$(basename "$MODEL_PATH")
+GTE_MODEL_PATH='/data_a100/models/gte-Qwen2-7B-instruct'
 
 # 2. 实验参数 (Zero-shot Steering)
 # 因为是零样本干预，我们不再需要区分 SOURCE，直接在特定数据集上验证
 DATASET="FOLIO"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
 LAYERS="12 16 20 24"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
-ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
+# ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
+ALPHAS="0.5"        # 干预强度网格搜索
 MODE="static"
 CALIB_SAMPLES=1000           # 用于提取 Δh 的无标签样本数量
 CONTEXT_REVERSE=true         # 用于将context放在question和option之后
@@ -21,6 +23,7 @@ EVAL_BATCH_SIZE=16          # 控制测试时的batch_size大小
 INSTANCE_STEERING=false       # 控制干预向量是单个还是一致的
 # vLLM 无 steer baseline：仅对第一条 Baseline 命令生效；repeat/pad 仍走 HF（另起进程）
 USE_VLLM=true
+GTE_STEER=true    # 是否使用gte进行steering
 # VLLM_MAX_MODEL_LEN=8192      # 可选，传给 --vllm_max_model_len
 # MAX_LENGTH=1024               # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
 # MAX_TEST_SAMPLES=10           # 控制测试时的样本数量，避免测试时间过长（你可以根据需要调整这个值，或者设置为 None 来使用全部样本）
@@ -103,6 +106,11 @@ if [ "$USE_VLLM" = true ]; then
       BASELINE_CMD_ORI="$BASELINE_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
       REPEAT_CMD="$REPEAT_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
     fi
+fi
+
+# 20260427 进行gte模型steer干预
+if [ "$GTE_STEER" = true ]; then
+    RUN_CMD="$RUN_CMD --steering_mode gte_steer --gte_model_path ${GTE_MODEL_PATH}"
 fi
 
 # # 先跑baseline的结果
