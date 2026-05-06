@@ -1,11 +1,11 @@
 #!/bin/bash
 
-GPU=0,3
+GPU=3
 export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
 # 1. 模型绝对路径
-MODEL_PATH="/data_a100/models/Qwen2.5-7B-Instruct"
+MODEL_PATH="/data_a100/models/Qwen2.5-3B-Instruct"
 MODEL_NAME=$(basename "$MODEL_PATH")
 
 # 2. 实验参数 (Zero-shot Steering)
@@ -19,7 +19,7 @@ ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
 MODE="static"
 CALIB_SAMPLES=1000           # 用于提取 Δh 的无标签样本数量
 CONTEXT_REVERSE=true         # 用于将context放在question和option之后
-EVAL_BATCH_SIZE=2           # 控制测试时的batch_size大小
+EVAL_BATCH_SIZE=16           # 控制测试时的batch_size大小
 INSTANCE_STEERING=false       # 控制干预向量是单个还是一致的
 # MAX_LENGTH=1024               # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
 # MAX_TEST_SAMPLES=10           # 控制测试时的样本数量，避免测试时间过长（你可以根据需要调整这个值，或者设置为 None 来使用全部样本）

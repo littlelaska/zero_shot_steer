@@ -509,11 +509,37 @@ class ActivationSteerer:
         input_template = "Instruct: {gte_instruction}\nQuery: {query}"
         input_prompt = [input_template.format(gte_instruction=gte_instruction, query=p) for p in single_prompts]
         gte_inputs = gte_tokenizer(input_prompt, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(gte_model.device)
+        with torch.no_grad():
+            gte_outputs = gte_model(**gte_inputs, output_hidden_states=True)
+        # gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
+        # print("gte_hidden dims are:", gte_hidden.shape)
+        
+        # 修改为按照抽取同层的隐向量
+        # 使用 self.layer_idx 获取 GTE 模型中对应层的 hidden_states
+        # 注意：hidden_states[0] 是 embedding 层，所以 layer_idx + 1 对应第 layer_idx 层 transformer 的输出
+        try:
+            # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
+            # 如果 GTE 层数少于 LLM，这里需要做越界检查
+            target_layer_idx = self.layer_idx + 1 
+            gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
+            print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
+        except IndexError:
+            # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
+            gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
+            print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
+        # ------------------
+        # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
+        print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
 
-        gte_outputs = gte_model(**gte_inputs, output_hidden_states=True)
-        gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-        print("gte_hidden dims are:", gte_hidden.shape)
-
+        main_model_dim = next(self.model.parameters()).shape[-1]
+        if gte_hidden.shape[-1] != main_model_dim:
+            # 如果维度不一致，必须进行对齐，这里建议抛出错误或添加一个投影矩阵
+            print(f"Dimension Mismatch: GTE({gte_hidden.shape[-1]}) vs LLM({main_model_dim})")
+            # 简单补齐示例（仅用于跑通代码，实际建议用线性投影）
+            if gte_hidden.shape[-1] < main_model_dim:
+                padding_vec = torch.zeros(gte_hidden.shape[0], main_model_dim - gte_hidden.shape[-1]).to(gte_hidden)
+                gte_hidden = torch.cat([gte_hidden, padding_vec], dim=-1)
+        
         normalized_gte = F.normalize(gte_hidden,p=2, dim=-1)
         # print("original norms: ", normalized_gte.squeeze().tolist())
 
@@ -522,11 +548,15 @@ class ActivationSteerer:
         def gte_hook(module, args, output):
             h = output[0] if isinstance(output, tuple) else output
             # 只在 Prefill 阶段干预最后一个 token
+            
             if h.shape[1] > 1:
                 # --- 核心：模长对齐策略 ---
                 # 提取当前层原始激活值的平均模长
                 orig_token = h[:, -1, :]
                 orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)
+                # 计算原始norm。用于后续计算干预比例
+                orig_norm_value = orig_norm.mean().item()
+                orig_std = orig_norm.std().item()
                 
                 # 缩放 GTE 向量：使干预信号的强度与原始激活值匹配
                 # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
@@ -535,18 +565,28 @@ class ActivationSteerer:
                 # 注入并保持总模长不变（防止数值崩溃）
                 steered_token = orig_token + scaled_vec
                 steered_norm = torch.norm(steered_token, p=2, dim=-1, keepdim=True)
+                steered_norm_value = steered_norm.mean().item()
+                steered_std = steered_norm.std().item()
+                # 计算干预强度
+                ratio = steered_norm_value / orig_norm_value if orig_norm_value != 0 else 0
+                # 仅在 Prefill 阶段或第一个 Token 时打印，避免日志刷屏
+            
+                print(f" > [Layer {self.layer_idx}] Norm Ratio: {ratio:.2%} (Orig: {orig_norm_value:.2f}, Steer: {steered_norm_value:.2f}), Orig Std: {orig_std:.2f}")
+
+                
                 h[:, -1, :] = steered_token * (orig_norm / (steered_norm + 1e-8))
                 
             return (h,) + output[1:] if isinstance(output, tuple) else h
 
         # 3. 注册并执行
-        # layer_module = self.model.model.layers[self.layer_idx] # Qwen 架构适配
         layer_module = self._get_layer_module()
         handle = layer_module.register_forward_hook(gte_hook)
         # 构建模型输入
         inputs = self.tokenizer(single_prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device) 
+        self.model.eval()
         try:
-            out = self.model.generate(**inputs, max_new_tokens=128, do_sample=False)
+            with torch.no_grad():
+                out = self.model.generate(**inputs, max_new_tokens=4096, do_sample=False, pad_token_id=self.tokenizer.pad_token_id)
         finally:
             handle.remove()
             
