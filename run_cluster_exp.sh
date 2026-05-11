@@ -5,7 +5,7 @@ MODEL_PATH="/data_a100/models/Qwen2.5-7B-Instruct"
 LAYER_TO_CHECK=16
 SAMPLE_COUNT=200 # 建议每个数据集 100-300 个样本以保证散点图清晰
 GPU_ID="7"
-
+BATCH_SIZE=16
 # 定义输出路径
 OUT_DIR="./cluster_results"
 mkdir -p $OUT_DIR
@@ -15,6 +15,7 @@ mkdir -p $OUT_DIR
 python cluster_delta_h.py \
     --model "$MODEL_PATH" \
     --layer $LAYER_TO_CHECK \
+    --batch_size $BATCH_SIZE \
     --samples $SAMPLE_COUNT \
     --gpu "$GPU_ID" \
     --out "$OUT_DIR/tsne_comparison_layer_${LAYER_TO_CHECK}.png" \
