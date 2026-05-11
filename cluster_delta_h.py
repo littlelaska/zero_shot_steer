@@ -117,6 +117,8 @@ class DeltaHClusterer:
             with open(file_path, 'r', encoding='utf-8') as f:
                 data = [json.loads(line) for line in f] if file_path.endswith('.jsonl') else json.load(f)
             
+            samples = data[:samples_per_data]
+
             # 分 Batch 处理数据
             for i in tqdm(range(0, len(samples), self.batch_size), desc=f"Extracting {label}"):
                 batch_ex = samples[i : i + self.batch_size]
