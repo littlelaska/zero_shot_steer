@@ -1,3 +1,4 @@
+# 计算cos_d 的相似度，运行脚本是run_delha_h.sh
 import torch
 import json
 import argparse
@@ -122,9 +123,21 @@ class AlignedLayerAnalyzer:
         
         similarities = []
         for l in range(self.num_layers + 1):
-            # 去中心化：计算该层的平均任务向量
-            mean_a = deltas_a[:, l, :].mean(dim=0, keepdim=True)
-            mean_b = deltas_b[:, l, :].mean(dim=0, keepdim=True)
+            # 老版本代码，直接计算了每个样本的余弦相似度后取平均，但这样会受到样本内噪声的影响。
+            # # 去中心化：计算该层的平均任务向量
+            # mean_a = deltas_a[:, l, :].mean(dim=0, keepdim=True)
+            # mean_b = deltas_b[:, l, :].mean(dim=0, keepdim=True)
+            # 提取该层所有样本的 Delta h
+            layer_deltas_a = deltas_a[:, l, :]  # [N, Dim]
+            layer_deltas_b = deltas_b[:, l, :]  # [N, Dim]
+            
+            # 【核心改进】先对每个样本进行 L2 归一化，消除模长（能量）带来的偏置 
+            norm_a = F.normalize(layer_deltas_a, p=2, dim=-1)
+            norm_b = F.normalize(layer_deltas_b, p=2, dim=-1)
+            
+            # 计算去中心化/无视模长干扰的质心方向 
+            mean_a = norm_a.mean(dim=0, keepdim=True)
+            mean_b = norm_b.mean(dim=0, keepdim=True)
             
             # 计算余弦相似度
             sim = F.cosine_similarity(mean_a, mean_b).item()

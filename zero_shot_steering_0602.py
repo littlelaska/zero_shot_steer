@@ -7,7 +7,6 @@ import torch
 from tqdm import tqdm
 from typing import List
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers import AutoModel, AutoConfig
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 import matplotlib.pyplot as plt
@@ -73,7 +72,7 @@ def _format_options_from_ex(ex):
         return "Options:\n" + "\n".join([f"{k}) {v}" for k, v in opt_obj.items()])
     return ""
 
-def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_repeat=False, repeat_times=1):
+def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_repeat=False):
     """
     构建 Prompt。如果 repeat=True，则应用论文中的 Query + Query 策略。
     - repeat=True: 语义重复 Query + Query（论文里的 Prompt Repetition）。
@@ -91,11 +90,8 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_r
     # 情况 1：重复语义的 Query + Query
     # 核心：复现论文的 Prompt Repetition
     if repeat and not pad_repeat:
-        if repeat_times > 1:
-            user_content = (base_query * repeat_times) + tail_prompt
         # 你也可以在这里尝试论文里的变体：base_query + "\n\nLet me repeat that:\n\n" + base_query
-        else:
-            user_content = base_query + base_query + tail_prompt
+        user_content = base_query + base_query + tail_prompt
     else:
         user_content = base_query + tail_prompt
     
@@ -407,6 +403,7 @@ class ActivationSteerer:
         return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
     
     # ... 原有的 __init__ 和 extract_features 保持不变 ...
+
     def generate_with_instance_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static", max_length: int = None):
         """
         [新增功能] 针对每个 Query 实时计算 Δh 并干预
@@ -493,106 +490,6 @@ class ActivationSteerer:
             
         return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
     
-    def generate_with_gte_steering(self, prompts: List[str], alpha: float = 1.0, gte_model=None, gte_tokenizer=None, max_length: int = None):
-        if max_length is None:
-            padding = True
-            max_length = self.max_length
-        else:
-            padding = "max_length"
-        # 1. 构建prompt
-        single_prompts = [build_prompts(x, self.tokenizer, repeat=False) for x in prompts]
-
-        gte_instruction = "Identify and represent the core logical premises, relational constraints, and deductive dependencies within the text to support step-by-step reasoning."
-        
-        # 2. 按照gte模板构建数据，并抽取干预向量
-        # 使用gte模型抽取干预向量
-        input_template = "Instruct: {gte_instruction}\nQuery: {query}"
-        input_prompt = [input_template.format(gte_instruction=gte_instruction, query=p) for p in single_prompts]
-        gte_inputs = gte_tokenizer(input_prompt, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(gte_model.device)
-        with torch.no_grad():
-            gte_outputs = gte_model(**gte_inputs, output_hidden_states=True)
-        # gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-        # print("gte_hidden dims are:", gte_hidden.shape)
-        
-        # 修改为按照抽取同层的隐向量
-        # 使用 self.layer_idx 获取 GTE 模型中对应层的 hidden_states
-        # 注意：hidden_states[0] 是 embedding 层，所以 layer_idx + 1 对应第 layer_idx 层 transformer 的输出
-        try:
-            # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
-            # 如果 GTE 层数少于 LLM，这里需要做越界检查
-            target_layer_idx = self.layer_idx + 1 
-            gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
-            print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
-        except IndexError:
-            # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
-            gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-            print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
-        # ------------------
-        # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
-        print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
-
-        main_model_dim = next(self.model.parameters()).shape[-1]
-        if gte_hidden.shape[-1] != main_model_dim:
-            # 如果维度不一致，必须进行对齐，这里建议抛出错误或添加一个投影矩阵
-            print(f"Dimension Mismatch: GTE({gte_hidden.shape[-1]}) vs LLM({main_model_dim})")
-            # 简单补齐示例（仅用于跑通代码，实际建议用线性投影）
-            if gte_hidden.shape[-1] < main_model_dim:
-                padding_vec = torch.zeros(gte_hidden.shape[0], main_model_dim - gte_hidden.shape[-1]).to(gte_hidden)
-                gte_hidden = torch.cat([gte_hidden, padding_vec], dim=-1)
-        
-        normalized_gte = F.normalize(gte_hidden,p=2, dim=-1)
-        # print("original norms: ", normalized_gte.squeeze().tolist())
-
-        vec_base = normalized_gte.to(device=self.device, dtype=self. model.dtype)
-
-        def gte_hook(module, args, output):
-            h = output[0] if isinstance(output, tuple) else output
-            # 只在 Prefill 阶段干预最后一个 token
-            
-            if h.shape[1] > 1:
-                # --- 核心：模长对齐策略 ---
-                # 提取当前层原始激活值的平均模长
-                orig_token = h[:, -1, :]
-                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)
-                # 计算原始norm。用于后续计算干预比例
-                orig_norm_value = orig_norm.mean().item()
-                orig_std = orig_norm.std().item()
-                
-                # 缩放 GTE 向量：使干预信号的强度与原始激活值匹配
-                # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
-                scaled_vec = vec_base * alpha * orig_norm
-                
-                # 注入并保持总模长不变（防止数值崩溃）
-                steered_token = orig_token + scaled_vec
-                steered_norm = torch.norm(steered_token, p=2, dim=-1, keepdim=True)
-                steered_norm_value = steered_norm.mean().item()
-                steered_std = steered_norm.std().item()
-                # 计算干预强度
-                ratio = steered_norm_value / orig_norm_value if orig_norm_value != 0 else 0
-                # 仅在 Prefill 阶段或第一个 Token 时打印，避免日志刷屏
-            
-                print(f" > [Layer {self.layer_idx}] Norm Ratio: {ratio:.2%} (Orig: {orig_norm_value:.2f}, Steer: {steered_norm_value:.2f}), Orig Std: {orig_std:.2f}")
-
-                
-                h[:, -1, :] = steered_token * (orig_norm / (steered_norm + 1e-8))
-                
-            return (h,) + output[1:] if isinstance(output, tuple) else h
-
-        # 3. 注册并执行
-        layer_module = self._get_layer_module()
-        handle = layer_module.register_forward_hook(gte_hook)
-        # 构建模型输入
-        inputs = self.tokenizer(single_prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device) 
-        self.model.eval()
-        try:
-            with torch.no_grad():
-                out = self.model.generate(**inputs, max_new_tokens=4096, do_sample=False, pad_token_id=self.tokenizer.pad_token_id)
-        finally:
-            handle.remove()
-            
-        return self.tokenizer.batch_decode(out, skip_special_tokens=True)
-
-
     # 新增功能：Logit Lens 分析干预向量的语义信息
     @torch.no_grad()
     def analyze_steering_vector(self, top_k: int = 10):
@@ -670,7 +567,7 @@ class ActivationSteerer:
         # 1. 提取隐状态并立即转为 FP32 (在 CPU 上计算降维，FP32 更稳健)
         prompts_s = [build_prompts(x, self.tokenizer, repeat=False) for x in data_samples]
         prompts_r = [build_prompts(x, self.tokenizer, repeat=True) for x in data_samples]
-
+        
         # 获取隐状态 [N, D]
         h_s = self.extract_features(prompts_s, batch_size=self.batch_size).cpu().float()
         h_r = self.extract_features(prompts_r, batch_size=self.batch_size).cpu().float()
@@ -775,27 +672,20 @@ class ActivationSteerer:
         # 1. 提取表征 [cite: 279-301]
         prompts_s = [build_prompts(x, repeat=False) for x in data_samples] # [cite: 85-114]
         prompts_r = [build_prompts(x, repeat=True) for x in data_samples]  # [cite: 85-114]
-        #  20260422 新增三次prompt，画图看是否会让模型趋势更强
-        prompts_r3 = [build_prompts(x, self.tokenizer, repeat=True, repeat_times=3) for x in data_samples]
-
+        
         h_s = self.extract_features(prompts_s, batch_size=self.batch_size).cpu().float()
         h_r = self.extract_features(prompts_r, batch_size=self.batch_size).cpu().float()
-        h_r3 = self.extract_features(prompts_r3, batch_size=self.batch_size).cpu().float()
-
         delta = h_r - h_s
         
         # 2. 拼接数据进行全局降维
         # 顺序: [0:N] 是 h_s, [N:2N] 是 h_r, [2N:3N] 是 delta
-        # combined_vectors = torch.cat([h_s, h_r, delta], dim=0)
-        # 顺序: [0:N] h_s, [N:2N] h_r2, [2N:3N] h_r3, [3N:4N] delta
-        combined_vectors = torch.cat([h_s, h_r, h_r3, delta], dim=0)
+        combined_vectors = torch.cat([h_s, h_r, delta], dim=0)
         combined_norm = F.normalize(combined_vectors, p=2, dim=-1).numpy()
         
         print(f"正在执行全局 t-SNE 降维 (总点数: {3*N})...")
         tsne_model = TSNE(
             n_components=2, 
-            # perplexity=min(30, (3*N) - 1), 
-            perplexity=min(30, (4*N) - 1), 
+            perplexity=min(30, (3*N) - 1), 
             random_state=42, 
             init='pca', 
             n_jobs=-1
@@ -803,18 +693,12 @@ class ActivationSteerer:
         tsne_results = tsne_model.fit_transform(combined_norm)
         
         # 3. 准备绘图数据
-        # vector_types = ["Single_h_s"] * N + ["Repeat_h_r"] * N + ["Delta_h"] * N
-        vector_types = (["Single_h_s"] * N + 
-                        ["Repeat2_h_r2"] * N + 
-                        ["Repeat3_h_r3"] * N + 
-                        ["Delta_h"] * N)
+        vector_types = ["Single_h_s"] * N + ["Repeat_h_r"] * N + ["Delta_h"] * N
         task_labels = []
         if label_key and label_key in data_samples[0]:
-            # task_labels = [str(x[label_key]) for x in data_samples] * 3
-            task_labels = [str(x[label_key]) for x in data_samples] * 4
+            task_labels = [str(x[label_key]) for x in data_samples] * 3
         else:
-            # task_labels = ["Default"] * (3 * N)
-            task_labels = ["Default"] * (4 * N)
+            task_labels = ["Default"] * (3 * N)
 
         df = pd.DataFrame({
             'x': tsne_results[:, 0],
@@ -824,24 +708,14 @@ class ActivationSteerer:
         })
         
         # 4. 绘图
-        # plt.figure(figsize=(14, 11))
-        plt.figure(figsize=(15, 12))
+        plt.figure(figsize=(14, 11))
         
-        # 定义颜色调色板
-        palette = {
-            'Single_h_s': '#3498db',    # 蓝色
-            'Repeat2_h_r2': '#e67e22',  # 橙色
-            'Repeat3_h_r3': '#e74c3c',  # 红色
-            'Delta_h': '#2ecc71'        # 绿色
-        }
         # 绘制背景点
         scatter = sns.scatterplot(
             data=df, x='x', y='y', hue='State', 
             style='Task' if len(set(task_labels)) > 1 else None,
-            # palette={'Single_h_s': '#3498db', 'Repeat_h_r': '#e74c3c', 'Delta_h': '#2ecc71'},
-            palette=palette,
-            # s=120, alpha=0.8, edgecolor='w', zorder=3
-            s=130, alpha=0.8, edgecolor='w', zorder=3
+            palette={'Single_h_s': '#3498db', 'Repeat_h_r': '#e74c3c', 'Delta_h': '#2ecc71'},
+            s=120, alpha=0.8, edgecolor='w', zorder=3
         )
 
         # --- 核心改进：绘制演进连线 ---
@@ -860,13 +734,6 @@ class ActivationSteerer:
                     shrinkA=5, shrinkB=5 # 稍微缩进，避免盖住点
                 ),
                 zorder=1 # 放在点下面
-            )
-            # 第二段：h_r -> h_r3
-            plt.annotate('', 
-                xy=(tsne_results[2*N + i, 0], tsne_results[2*N + i, 1]), 
-                xytext=(tsne_results[N + i, 0], tsne_results[N + i, 1]),
-                arrowprops=dict(arrowstyle='->', color='black', lw=0.8, alpha=0.3, shrinkA=4, shrinkB=4),
-                zorder=2
             )
         
         # 5. 美化图表
@@ -894,78 +761,6 @@ def vllm_generate_batch(llm, prompts: List[str], max_new_tokens: int = 4096) -> 
     sampling_params = SamplingParams(temperature=0, max_tokens=max_new_tokens)
     outputs = llm.generate(prompts, sampling_params)
     return [out.outputs[0].text for out in outputs]
-
-# 测试用embedding模型
-class GTEInjectedSteerer:
-    def __init__(self, reasoning_model, gte_model, tokenizer, layer_idx):
-        self.model = reasoning_model
-        self.gte_model = gte_model
-        self.tokenizer = tokenizer
-        self.layer_idx = layer_idx
-        self.device = reasoning_model.device
-    
-    # 可以更换不同的instruction
-    def format_gte_query(self, instruction, text_context):
-        # GTE 官方要求：Instruct:{任务}\nQuery:{内容}
-        return f"Instruct: {instruction}\nQuery: {text_context}"
-
-    @torch.no_grad()
-    def extract_gte_guidance_vector(self, instruction_text):
-        """
-        从 GTE 模型中提取指令引导向量
-        """
-        # GTE 官方推荐的 Prompt 格式
-        input_text = f"Instruct: {instruction_text}\nQuery: "
-        inputs = self.tokenizer(input_text, return_tensors="pt", padding=True).to(self.gte_model.device)
-        
-        # 提取 GTE 最后一层的隐藏状态
-        outputs = self.gte_model(**inputs, output_hidden_states=True)
-        # 获取最后一个 token 的表征 [1, Dim]
-        # 注意：GTE 默认会进行 L2 归一化，我们先拿到原始方向
-        gte_hidden = outputs.hidden_states[-1][:, -1, :]
-        return F.normalize(gte_hidden, p=2, dim=-1)
-
-    def inject_and_generate(self, prompts, guidance_vector, alpha=1.0):
-        """
-        将 GTE 向量缩放并注入推理模型
-        """
-        # 1. 编码推理任务的输入
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
-        
-        # 2. 定义带模长恢复的 Hook [cite: 310-353]
-        # 将 GTE 向量转移到推理模型精度和设备
-        vec_base = guidance_vector.to(device=self.device, dtype=self.model.dtype)
-
-        def gte_hook(module, args, output):
-            h = output[0] if isinstance(output, tuple) else output
-            # 只在 Prefill 阶段干预最后一个 token
-            if h.shape[1] > 1:
-                # --- 核心：模长对齐策略 ---
-                # 提取当前层原始激活值的平均模长
-                orig_token = h[:, -1, :]
-                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)
-                
-                # 缩放 GTE 向量：使干预信号的强度与原始激活值匹配
-                # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
-                scaled_vec = vec_base * alpha * orig_norm
-                
-                # 注入并保持总模长不变（防止数值崩溃）
-                steered_token = orig_token + scaled_vec
-                steered_norm = torch.norm(steered_token, p=2, dim=-1, keepdim=True)
-                h[:, -1, :] = steered_token * (orig_norm / (steered_norm + 1e-8))
-                
-            return (h,) + output[1:] if isinstance(output, tuple) else h
-
-        # 3. 注册并执行
-        layer_module = self.model.model.layers[self.layer_idx] # Qwen 架构适配
-        handle = layer_module.register_forward_hook(gte_hook)
-        
-        try:
-            out = self.model.generate(**inputs, max_new_tokens=128, do_sample=False)
-        finally:
-            handle.remove()
-            
-        return self.tokenizer.batch_decode(out, skip_special_tokens=True)
 
 
 def main():
@@ -996,10 +791,6 @@ def main():
     parser.add_argument("--use_vllm", action="store_true", help="使用 vLLM 推理（仅支持 alpha=0、非 instance_steering；不支持 pad_repeat）")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="vLLM gpu_memory_utilization")
     parser.add_argument("--vllm_max_model_len", type=int, default=None, help="可选，传给 vLLM 的 max_model_len")
-    
-    # 20260427 新增gte模型
-    parser.add_argument("--gte_model_path",type=str, default="/data_a100/models/gte-Qwen2-7B-instruct", help="gte model load path")
-    parser.add_argument("--steering_mode", type=str, default="llm_steer",help="可选值llm_steer/gte_steer，分别代表用原始llm和gte模型抽取干预向量")
 
     args = parser.parse_args()
 
@@ -1050,27 +841,10 @@ def main():
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
         # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
         steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
-    
-    # 如果是gte干预，则需要加载gte模型
-    if args.steering_mode == "gte_steer":
-        gte_tokenizer = AutoTokenizer.from_pretrained(args.gte_model_path, trust_remote_code=True)
-        config = AutoConfig.from_pretrained(args.gte_model_path, trust_remote_code=True)
-        # 2. 手动补上缺失的属性 (Qwen2 默认通常是 1000000.0)
-        if not hasattr(config, 'rope_theta'):
-            config.rope_theta = 1000000.0
-        gte_model = AutoModel.from_pretrained(
-            args.gte_model_path,
-            config=config, 
-            trust_remote_code=True,
-            device_map="auto",
-            torch_dtype=torch.bfloat16
-            )
-        
-        gte_model.config.use_cache = False
-        
+
     # 3. Compute Steering Vector (Zero-shot, No Labels Needed)
     # laska修改，某些情况下不需要进入这个函数 1. instance steering 模式下每个样例单独计算向量 2. alpha=0 的情况下不需要计算向量（虽然不计算向量也不会报错，但为了效率我们直接跳过）
-    if (not args.use_vllm) and (not args.instance_steering) and (args.alpha != 0.0) and (args.steering_mode != "gte_steer"):
+    if (not args.use_vllm) and (not args.instance_steering) and (args.alpha != 0.0):
         steerer.compute_steering_vector(calib_data)
        
         # 新增一个对干预向量进行分析的步骤
@@ -1090,7 +864,6 @@ def main():
         )
             
     # 4. Inference on Test Set
-    # exit()
     print(f"\n=== Starting Inference ===")
     os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
     open(args.output_file, "w").close() 
@@ -1111,14 +884,6 @@ def main():
                 alpha=args.alpha, 
                 intervention_mode=args.intervention_mode
             )
-        # laska 20260427 新增使用gte进行steer
-        elif args.steering_mode == "gte_steer" and args.alpha != 0.0:
-            batch_outputs = steerer.generate_with_gte_steering(
-                batch_ex,
-                alpha=args.alpha,
-                gte_model=gte_model, 
-                gte_tokenizer=gte_tokenizer
-                )
         else:
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)
             # baseline 的单个 prompt、reverse、repeat、pad_repeat 都在这里处理

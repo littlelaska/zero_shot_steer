@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # 配置环境
-# MODEL_PATH="llms/Qwen2.5-7B-Instruct"
-MODEL_PATH="llms/gemma-3-12b-it"
+MODEL_PATH="/pcl_data/users/laska/models/Qwen2.5-3B-Instruct"
+# MODEL_PATH="/pcl_data/users/laska/models/gemma-3-12b-it"
 MODEL_NAME=$(basename "$MODEL_PATH")
 LAYER_TO_CHECK=4
 LAYER_END=40
 SAMPLE_COUNT=200 # 建议每个数据集 100-300 个样本以保证散点图清晰
-GPU_ID="0,1,2,3"
+GPU_ID="3"
 BATCH_SIZE=32
 # 定义输出路径
 OUT_DIR="./cluster_results/${MODEL_NAME}"
@@ -15,7 +15,7 @@ mkdir -p $OUT_DIR
 
 # 运行聚类分析
 # 传入的数据集建议涵盖：多个逻辑数据集(应聚在一起) + 常识数据集(应分开) + 负对照(应分散)
-for LAYER in $(seq 26 "$LAYER_END"); do
+for LAYER in $(seq 1 "$LAYER_END"); do
     python cluster_delta_h.py \
         --model "$MODEL_PATH" \
         --layer $LAYER \
