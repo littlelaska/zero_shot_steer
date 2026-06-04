@@ -1,14 +1,14 @@
 #!/bin/bash
 
 # --- 实验参数配置 ---
-MODEL_PATH="/pcl_data/users/laska/models/Qwen2.5-3B-Instruct"  # 修改为你的模型路径
+MODEL_PATH="/pcl_data/users/laska/models/Qwen2.5-7B-Instruct"  # 修改为你的模型路径
 MODEL_NAME=$(basename "$MODEL_PATH")
-DATA_A="AR-LSAT"
-DATA_B="gsm8k"
+DATA_A="FOLIO"
+DATA_B="commonsense"
 DATA_A_PATH="./data/${DATA_A}/train.json"
 DATA_B_PATH="./data/${DATA_B}/train.json"
 SAMPLES=1000
-GPU_ID="3"  # 指定使用的显卡序号
+GPU_ID="2"  # 指定使用的显卡序号
 # TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 OUTPUT_DIR="./delta_h_results/${DATA_A}_${DATA_B}_sim_analysis_${MODEL_NAME}"
 

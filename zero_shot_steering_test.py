@@ -493,7 +493,7 @@ class ActivationSteerer:
             
         return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
     
-    def generate_with_gte_steering(self, prompts: List[str], alpha: float = 1.0, gte_model=None, gte_tokenizer=None, max_length: int = None):
+    def generate_with_gte_steering(self, prompts: List[str], alpha: float = 1.0, gte_model=None, gte_tokenizer=None, max_length: int = None, gte_same_layer=False):
         if max_length is None:
             padding = True
             max_length = self.max_length
@@ -511,25 +511,27 @@ class ActivationSteerer:
         gte_inputs = gte_tokenizer(input_prompt, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(gte_model.device)
         with torch.no_grad():
             gte_outputs = gte_model(**gte_inputs, output_hidden_states=True)
-        # gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-        # print("gte_hidden dims are:", gte_hidden.shape)
-        
-        # 修改为按照抽取同层的隐向量
-        # 使用 self.layer_idx 获取 GTE 模型中对应层的 hidden_states
-        # 注意：hidden_states[0] 是 embedding 层，所以 layer_idx + 1 对应第 layer_idx 层 transformer 的输出
-        try:
-            # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
-            # 如果 GTE 层数少于 LLM，这里需要做越界检查
-            target_layer_idx = self.layer_idx + 1 
-            gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
-            print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
-        except IndexError:
-            # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
+        # 通过参数控制gte模型中抽取向量的层数
+        if not gte_same_layer:   # 抽取gte模型的最后一层
             gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-            print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
-        # ------------------
-        # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
-        print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
+            print("the gte_hidden is extract from the last layer, gte_hidden dims are:", gte_hidden.shape)
+        else:   # 抽取gte与LLM同层的隐向量
+            # 修改为按照抽取同层的隐向量
+            # 使用 self.layer_idx 获取 GTE 模型中对应层的 hidden_states
+            # 注意：hidden_states[0] 是 embedding 层，所以 layer_idx + 1 对应第 layer_idx 层 transformer 的输出
+            try:
+                # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
+                # 如果 GTE 层数少于 LLM，这里需要做越界检查
+                target_layer_idx = self.layer_idx + 1 
+                gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
+                print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
+            except IndexError:
+                # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
+                gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
+                print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
+            # ------------------
+            # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
+            print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
 
         main_model_dim = next(self.model.parameters()).shape[-1]
         if gte_hidden.shape[-1] != main_model_dim:
@@ -999,6 +1001,8 @@ def main():
     
     # 20260427 新增gte模型
     parser.add_argument("--gte_model_path",type=str, default="/data_a100/models/gte-Qwen2-7B-instruct", help="gte model load path")
+    # 20260604 新增gte抽取干预向量的层数，默认为最后一层
+    parser.add_argument("--gte_same_layer", action="store_true", help="从GTE模型的哪一层抽取干预向量，默认为false（最后一层）,true 时抽取和llm干预的同层")
     parser.add_argument("--steering_mode", type=str, default="llm_steer",help="可选值llm_steer/gte_steer，分别代表用原始llm和gte模型抽取干预向量")
 
     args = parser.parse_args()
@@ -1016,12 +1020,12 @@ def main():
     print(f"==============================")
     
     # 1. Load Data
-    if not args.instance_steering and args.alpha != 0.0:
+    if not args.instance_steering and args.alpha != 0.0 and args.steering_mode != "gte_steer": # instance steering 模式下每个样例单独计算向量，且gte steer模式下向量来源于gte模型，不需要calib数据
         print(f"Loading calibration data from {args.calib_file} (max {args.calib_samples} samples)...")
         calib_data = load_data_file(args.calib_file, max_n=args.calib_samples)
     test_data = load_data_file(args.test_file, max_n=args.max_test_samples)
     
-    if not args.instance_steering and args.alpha != 0.0:
+    if not args.instance_steering and args.alpha != 0.0 and args.steering_mode != "gte_steer":
         if not calib_data:
             print("[Error] Calibration data empty.")
             return
@@ -1117,7 +1121,8 @@ def main():
                 batch_ex,
                 alpha=args.alpha,
                 gte_model=gte_model, 
-                gte_tokenizer=gte_tokenizer
+                gte_tokenizer=gte_tokenizer,
+                gte_same_layer=args.gte_same_layer
                 )
         else:
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)

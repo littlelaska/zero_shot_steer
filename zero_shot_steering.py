@@ -511,25 +511,25 @@ class ActivationSteerer:
         gte_inputs = gte_tokenizer(input_prompt, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(gte_model.device)
         with torch.no_grad():
             gte_outputs = gte_model(**gte_inputs, output_hidden_states=True)
-        # gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-        # print("gte_hidden dims are:", gte_hidden.shape)
+        gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
+        print("gte embedding is extracted from the last layer,gte_hidden dims are:", gte_hidden.shape)
         
         # 修改为按照抽取同层的隐向量
         # 使用 self.layer_idx 获取 GTE 模型中对应层的 hidden_states
         # 注意：hidden_states[0] 是 embedding 层，所以 layer_idx + 1 对应第 layer_idx 层 transformer 的输出
-        try:
-            # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
-            # 如果 GTE 层数少于 LLM，这里需要做越界检查
-            target_layer_idx = self.layer_idx + 1 
-            gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
-            print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
-        except IndexError:
-            # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
-            gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-            print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
-        # ------------------
-        # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
-        print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
+        # try:
+        #     # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
+        #     # 如果 GTE 层数少于 LLM，这里需要做越界检查
+        #     target_layer_idx = self.layer_idx + 1 
+        #     gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
+        #     print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
+        # except IndexError:
+        #     # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
+        #     gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
+        #     print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
+        # # ------------------
+        # # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
+        # print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
 
         main_model_dim = next(self.model.parameters()).shape[-1]
         if gte_hidden.shape[-1] != main_model_dim:
