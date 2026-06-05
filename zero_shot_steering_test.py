@@ -545,7 +545,7 @@ class ActivationSteerer:
         normalized_gte = F.normalize(gte_hidden,p=2, dim=-1)
         # print("original norms: ", normalized_gte.squeeze().tolist())
 
-        vec_base = normalized_gte.to(device=self.device, dtype=self. model.dtype)
+        vec_base = normalized_gte.to(device=self.device, dtype=self.model.dtype)
 
         def gte_hook(module, args, output):
             h = output[0] if isinstance(output, tuple) else output
@@ -555,14 +555,14 @@ class ActivationSteerer:
                 # --- 核心：模长对齐策略 ---
                 # 提取当前层原始激活值的平均模长
                 orig_token = h[:, -1, :]
-                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)
+                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True).to(device=self.device, dtype=self.model.dtype)
                 # 计算原始norm。用于后续计算干预比例
                 orig_norm_value = orig_norm.mean().item()
                 orig_std = orig_norm.std().item()
                 
                 # 缩放 GTE 向量：使干预信号的强度与原始激活值匹配
                 # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
-                scaled_vec = vec_base * alpha * orig_norm
+                scaled_vec = vec_base * alpha * orig_norm.to(device=self.device, dtype=self.model.dtype)
                 
                 # 注入并保持总模长不变（防止数值崩溃）
                 steered_token = orig_token + scaled_vec
