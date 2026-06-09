@@ -1,6 +1,6 @@
 #!/bin/bash
 
-GPU=0,1
+GPU=1
 export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
@@ -11,11 +11,11 @@ GTE_MODEL_PATH='/pcl_data/users/laska/models/gte-Qwen2-7B-instruct'
 
 # 2. 实验参数 (Zero-shot Steering)
 # 因为是零样本干预，我们不再需要区分 SOURCE，直接在特定数据集上验证
-DATASET="ProofWriter"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
+DATASET="LogicalDeduction"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
 LAYERS="12 16 20 24"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 # LAYERS="6 10 12 16 20 24 26 30 34 38 40 42 44 46"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 # LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
-LAYERS="6 10 12 16 20 24 26"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
+# LAYERS="6 10 12 16 20 24 26"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
 MODE="static"
 CALIB_SAMPLES=1000           # 用于提取 Δh 的无标签样本数量
@@ -108,46 +108,49 @@ if [ "$USE_VLLM" = true ]; then
       BASELINE_CMD_ORI="$BASELINE_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
       REPEAT_CMD="$REPEAT_CMD --vllm_max_model_len $VLLM_MAX_MODEL_LEN"
     fi
+else
+    BASELINE_CMD_ORI="$RUN_CMD --alpha 0.0"
+    REPEAT_CMD="$RUN_CMD --alpha 0.0"
 fi
 
-# # 先跑baseline的结果
-# # 跑一个 Baseline (alpha=0.0，不加干预) 用于对比
-# echo "--------------------------------------------------"
-# echo "Running Baseline (No Intervention, Alpha=0.0)"
-# echo "--------------------------------------------------"
-# BASELINE_CMD="$BASELINE_CMD_ORI --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_baseline_alpha_0.0.jsonl"
-# echo "RUN_CMD: ${BASELINE_CMD}"
-# echo "--------------------------------------------------"
-# ${BASELINE_CMD}
+# 先跑baseline的结果
+# 跑一个 Baseline (alpha=0.0，不加干预) 用于对比
+echo "--------------------------------------------------"
+echo "Running Baseline (No Intervention, Alpha=0.0)"
+echo "--------------------------------------------------"
+BASELINE_CMD="$BASELINE_CMD_ORI --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_baseline_alpha_0.0.jsonl"
+echo "RUN_CMD: ${BASELINE_CMD}"
+echo "--------------------------------------------------"
+${BASELINE_CMD}
 
-# # laska修改，新增一个reverse的baseline
-# echo "--------------------------------------------------"
-# echo "Running Reverse Baseline (No Intervention, Alpha=0.0)"
-# echo "--------------------------------------------------"
-# if [ "$CONTEXT_REVERSE" = true ]; then
-#   REVERSE_BASELINE_CMD="$BASELINE_CMD_ORI --reverse_context --output_file ${OUT_DIR}/results_reverse_baseline_alpha_0.0.jsonl"
-#   echo "RUN_CMD: ${REVERSE_BASELINE_CMD}"
-#   echo "--------------------------------------------------"
-#   ${REVERSE_BASELINE_CMD}
-# fi
+# laska修改，新增一个reverse的baseline
+echo "--------------------------------------------------"
+echo "Running Reverse Baseline (No Intervention, Alpha=0.0)"
+echo "--------------------------------------------------"
+if [ "$CONTEXT_REVERSE" = true ]; then
+  REVERSE_BASELINE_CMD="$BASELINE_CMD_ORI --reverse_context --output_file ${OUT_DIR}/results_reverse_baseline_alpha_0.0.jsonl"
+  echo "RUN_CMD: ${REVERSE_BASELINE_CMD}"
+  echo "--------------------------------------------------"
+  ${REVERSE_BASELINE_CMD}
+fi
 
-# # laska修改，新增一个prompt repeat的baseline
-# echo "--------------------------------------------------"
-# echo "Running Prompt Repeat Baseline (No Intervention, Alpha=0.0)"
-# echo "--------------------------------------------------"
-# REPEAT_CMD="$REPEAT_CMD --repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_repeat_baseline_alpha_0.0.jsonl"
-# echo "RUN_CMD: ${REPEAT_CMD}"
-# echo "--------------------------------------------------"
-# ${REPEAT_CMD}
+# laska修改，新增一个prompt repeat的baseline
+echo "--------------------------------------------------"
+echo "Running Prompt Repeat Baseline (No Intervention, Alpha=0.0)"
+echo "--------------------------------------------------"
+REPEAT_CMD="$REPEAT_CMD --repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_repeat_baseline_alpha_0.0.jsonl"
+echo "RUN_CMD: ${REPEAT_CMD}"
+echo "--------------------------------------------------"
+${REPEAT_CMD}
 
-# # 0331新增，新增一个用pad进行prompt重复的baseline
-# echo "--------------------------------------------------"
-# echo "Running Padding Token Repeat Baseline (No Intervention, Alpha=0.0)"
-# echo "--------------------------------------------------"
-# PAD_REPEAT_CMD="$REPEAT_CMD --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
-# echo "RUN_CMD: ${PAD_REPEAT_CMD}"
-# echo "--------------------------------------------------"
-# ${PAD_REPEAT_CMD}
+# 0331新增，新增一个用pad进行prompt重复的baseline
+echo "--------------------------------------------------"
+echo "Running Padding Token Repeat Baseline (No Intervention, Alpha=0.0)"
+echo "--------------------------------------------------"
+PAD_REPEAT_CMD="$REPEAT_CMD --pad_repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_pad_repeat_baseline_alpha_0.0.jsonl"
+echo "RUN_CMD: ${PAD_REPEAT_CMD}"
+echo "--------------------------------------------------"
+${PAD_REPEAT_CMD}
 
 # # 是否对单个样例实施定制化的干预
 # if [ "$INSTANCE_STEERING" = true ]; then
@@ -163,41 +166,41 @@ if [ "$GTE_STEER" = true ]; then
     RUN_CMD="$RUN_CMD --steering_mode gte_steer --gte_model_path ${GTE_MODEL_PATH}"
 fi
 
-# 按照layers和alphas的组合进行网格搜索
-# ================= 循环执行 =================
-# 嵌套循环跑网格搜索 (层数 x 干预强度)
-for layer in $LAYERS
-do
-    for alpha in $ALPHAS
-    do  
-        OUT_FILE="${OUT_DIR}/results_layer_${layer}_alpha_${alpha}.jsonl"
-        if [ "$INSTANCE_STEERING" = true ]; then
-          OUT_FILE="${OUT_DIR}/instance_results_layer_${layer}_alpha_${alpha}.jsonl"
-        fi
-        # gte steer的结果文件命名区分开
-        if [ "$GTE_STEER" = true ]; then
-          OUT_FILE="${OUT_DIR}/gte_results_layer_${layer}_alpha_${alpha}.jsonl"
-        fi
-        # if [ "$CONTEXT_REVERSE" = true ]; then
-        #   OUT_FILE="${OUT_DIR}/results_reverse_layer_${layer}_alpha_${alpha}.jsonl"
-        # fi
-        SUB_RUN_CMD="$RUN_CMD --layer ${layer} --alpha ${alpha} --output_file ${OUT_FILE}"
+# # 按照layers和alphas的组合进行网格搜索
+# # ================= 循环执行 =================
+# # 嵌套循环跑网格搜索 (层数 x 干预强度)
+# for layer in $LAYERS
+# do
+#     for alpha in $ALPHAS
+#     do  
+#         OUT_FILE="${OUT_DIR}/results_layer_${layer}_alpha_${alpha}.jsonl"
+#         if [ "$INSTANCE_STEERING" = true ]; then
+#           OUT_FILE="${OUT_DIR}/instance_results_layer_${layer}_alpha_${alpha}.jsonl"
+#         fi
+#         # gte steer的结果文件命名区分开
+#         if [ "$GTE_STEER" = true ]; then
+#           OUT_FILE="${OUT_DIR}/gte_results_layer_${layer}_alpha_${alpha}.jsonl"
+#         fi
+#         # if [ "$CONTEXT_REVERSE" = true ]; then
+#         #   OUT_FILE="${OUT_DIR}/results_reverse_layer_${layer}_alpha_${alpha}.jsonl"
+#         # fi
+#         SUB_RUN_CMD="$RUN_CMD --layer ${layer} --alpha ${alpha} --output_file ${OUT_FILE}"
         
-        echo "--------------------------------------------------"
-        echo "时间: $(date)"
-        echo "Model: $MODEL_NAME | Dataset: $DATASET"
-        echo "Steering Layer: $layer | Alpha: $alpha | Mode: $MODE"
-        echo "Output Path: $OUT_DIR"
-        echo "Output File: $OUT_FILE"
-        echo "RUN_CMD: $SUB_RUN_CMD"
-        echo "--------------------------------------------------"
+#         echo "--------------------------------------------------"
+#         echo "时间: $(date)"
+#         echo "Model: $MODEL_NAME | Dataset: $DATASET"
+#         echo "Steering Layer: $layer | Alpha: $alpha | Mode: $MODE"
+#         echo "Output Path: $OUT_DIR"
+#         echo "Output File: $OUT_FILE"
+#         echo "RUN_CMD: $SUB_RUN_CMD"
+#         echo "--------------------------------------------------"
         
-        # 执行命令
-        ${SUB_RUN_CMD}
+#         # 执行命令
+#         ${SUB_RUN_CMD}
 
-        echo "完成: Layer $layer, Alpha $alpha"
-    done
-done
+#         echo "完成: Layer $layer, Alpha $alpha"
+#     done
+# done
 
 echo "=================================================="
 echo "实验全部结束: $(date)"

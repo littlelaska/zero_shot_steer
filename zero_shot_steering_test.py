@@ -555,14 +555,20 @@ class ActivationSteerer:
                 # --- 核心：模长对齐策略 ---
                 # 提取当前层原始激活值的平均模长
                 orig_token = h[:, -1, :]
-                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True).to(device=self.device, dtype=self.model.dtype)
+                current_device = orig_token.device
+                current_dtype = orig_token.dtype
+
+                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)   # [B, 1]
                 # 计算原始norm。用于后续计算干预比例
                 orig_norm_value = orig_norm.mean().item()
                 orig_std = orig_norm.std().item()
-                
+
+                # 【核心修复】强制将外部的 vec_base 转换为当前层的设备和类型
+                # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
+                safe_vec_base = vec_base.to(device=current_device, dtype=current_dtype)
                 # 缩放 GTE 向量：使干预信号的强度与原始激活值匹配
                 # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
-                scaled_vec = vec_base * alpha * orig_norm.to(device=self.device, dtype=self.model.dtype)
+                scaled_vec = safe_vec_base * alpha * orig_norm
                 
                 # 注入并保持总模长不变（防止数值崩溃）
                 steered_token = orig_token + scaled_vec
