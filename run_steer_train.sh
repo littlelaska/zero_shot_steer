@@ -20,7 +20,7 @@ ALPHAS="0.5 1 1.5"        # 干预强度网格搜索
 MODE="static"
 CALIB_SAMPLES=1000           # 用于提取 Δh 的无标签样本数量
 CONTEXT_REVERSE=true         # 用于将context放在question和option之后
-EVAL_BATCH_SIZE=16            # 控制测试时的batch_size大小,vllm可以开到很大以加速测试
+EVAL_BATCH_SIZE=32            # 控制测试时的batch_size大小,vllm可以开到很大以加速测试
 INSTANCE_STEERING=false       # 控制干预向量是单个还是一致的
 # vLLM 无 steer baseline：仅对第一条 Baseline 命令生效；repeat/pad 仍走 HF（另起进程）
 USE_VLLM=true

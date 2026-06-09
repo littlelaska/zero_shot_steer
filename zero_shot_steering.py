@@ -243,7 +243,7 @@ class ActivationSteerer:
         attn_list = []
         max_L = 0
         
-        for p in formatted:
+        for p in prompts:
             ids = self.tokenizer(p, add_special_tokens=False, padding=False, truncation=True, max_length=self.max_length)["input_ids"]
             real_len = len(ids)
             # 计算需要补充的 pad 数量
@@ -1059,7 +1059,7 @@ def main():
     
     # 如果是gte干预，则需要加载gte模型
     if args.steering_mode == "gte_steer":
-        gte_tokenizer = AutoTokenizer.from_pretrained(args.gte_model_path, trust_remote_code=True)
+        gte_tokenizer = AutoTokenizer.from_pretrained(args.gte_model_path, trust_remote_code=True, padding_side="left")
         config = AutoConfig.from_pretrained(args.gte_model_path, trust_remote_code=True)
         # 2. 手动补上缺失的属性 (Qwen2 默认通常是 1000000.0)
         if not hasattr(config, 'rope_theta'):
