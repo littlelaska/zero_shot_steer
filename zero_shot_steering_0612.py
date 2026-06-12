@@ -137,24 +137,22 @@ def check_is_correct(prediction, ground_truth):
 # ==========================================
 
 class ActivationSteerer:
-    def __init__(self, model, tokenizer, args: argparse.Namespace):
+    def __init__(self, model, tokenizer, layer_idx: int, max_length: int, batch_size: int = 4):
         self.model = model
         self.tokenizer = tokenizer
-        self.layer_idx = args.layer
+        self.layer_idx = layer_idx
         self.device = model.device
         self.steering_vector = None # 用于存储计算出的 Δh
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.batch_size = args.eval_batch_size
-        if args.max_length is not None:   # 非空的时候
-            self.max_length = args.max_length
+        self.batch_size = batch_size
+        if max_length is not None:   # 非空的时候
+            self.max_length = max_length
             self.padding = "max_length"
         else:
             self.max_length = 8192
             self.padding = True # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
-        if args.repeat_times is not None:  # 新增控制重复次数的参数，即delta h从重复多少次的prompt中进行抽取
-            self.repeat_times = args.repeat_times
 
     def _get_layer_module(self):
         """自动寻找各模型的 transformer layers 容器"""
@@ -199,9 +197,9 @@ class ActivationSteerer:
         """
         batch_size = self.batch_size
         # print(f"\n[Steering] Computing difference vector over {len(data_samples)} calibration samples...")
-        print(f"\n[Steering] Computing normalized difference vector..., the repeat_times is {self.repeat_times}")
+        print(f"\n[Steering] Computing normalized difference vector...")
         prompts_single = [build_prompts(x, self.tokenizer, repeat=False) for x in data_samples]
-        prompts_repeat = [build_prompts(x, self.tokenizer, repeat=True, repeat_times=self.repeat_times) for x in data_samples]
+        prompts_repeat = [build_prompts(x, self.tokenizer, repeat=True) for x in data_samples]
         
         # 1. 提取两种 Prompt 的隐状态，特征
         h1 = self.extract_features(prompts_single, batch_size)
@@ -495,7 +493,7 @@ class ActivationSteerer:
             
         return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
     
-    def generate_with_gte_steering(self, prompts: List[str], alpha: float = 1.0, gte_model=None, gte_tokenizer=None, max_length: int = None, gte_same_layer=False):
+    def generate_with_gte_steering(self, prompts: List[str], alpha: float = 1.0, gte_model=None, gte_tokenizer=None, max_length: int = None):
         if max_length is None:
             padding = True
             max_length = self.max_length
@@ -513,27 +511,25 @@ class ActivationSteerer:
         gte_inputs = gte_tokenizer(input_prompt, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(gte_model.device)
         with torch.no_grad():
             gte_outputs = gte_model(**gte_inputs, output_hidden_states=True)
-        # 通过参数控制gte模型中抽取向量的层数
-        if not gte_same_layer:   # 抽取gte模型的最后一层
-            gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-            print("the gte_hidden is extract from the last layer, gte_hidden dims are:", gte_hidden.shape)
-        else:   # 抽取gte与LLM同层的隐向量
-            # 修改为按照抽取同层的隐向量
-            # 使用 self.layer_idx 获取 GTE 模型中对应层的 hidden_states
-            # 注意：hidden_states[0] 是 embedding 层，所以 layer_idx + 1 对应第 layer_idx 层 transformer 的输出
-            try:
-                # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
-                # 如果 GTE 层数少于 LLM，这里需要做越界检查
-                target_layer_idx = self.layer_idx + 1 
-                gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
-                print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
-            except IndexError:
-                # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
-                gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
-                print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
-            # ------------------
-            # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
-            print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
+        gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
+        print("gte embedding is extracted from the last layer,gte_hidden dims are:", gte_hidden.shape)
+        
+        # 修改为按照抽取同层的隐向量
+        # 使用 self.layer_idx 获取 GTE 模型中对应层的 hidden_states
+        # 注意：hidden_states[0] 是 embedding 层，所以 layer_idx + 1 对应第 layer_idx 层 transformer 的输出
+        # try:
+        #     # 获取与 LLM 干预层索引一致的 GTE 隐藏层状态
+        #     # 如果 GTE 层数少于 LLM，这里需要做越界检查
+        #     target_layer_idx = self.layer_idx + 1 
+        #     gte_hidden = gte_outputs.hidden_states[target_layer_idx][:, -1, :]
+        #     print(f"Extracted GTE features from layer {self.layer_idx} (index {target_layer_idx})")
+        # except IndexError:
+        #     # 兜底方案：如果 GTE 模型层数不够，则取其最后一层
+        #     gte_hidden = gte_outputs.hidden_states[-1][:, -1, :]
+        #     print(f"Warning: Layer {self.layer_idx} out of range for GTE model. Using last layer instead.")
+        # # ------------------
+        # # 维度对齐检查（针对可能存在的 Hidden Size 不一致）
+        # print("the hidden states are extract from layer {}, gte_hidden dims are {}".format(target_layer_idx, gte_hidden.shape))
 
         main_model_dim = next(self.model.parameters()).shape[-1]
         if gte_hidden.shape[-1] != main_model_dim:
@@ -560,11 +556,11 @@ class ActivationSteerer:
                 current_device = orig_token.device
                 current_dtype = orig_token.dtype
 
-                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)   # [B, 1]
+                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)  # [B, 1]
                 # 计算原始norm。用于后续计算干预比例
                 orig_norm_value = orig_norm.mean().item()
                 orig_std = orig_norm.std().item()
-
+                
                 # 【核心修复】强制将外部的 vec_base 转换为当前层的设备和类型
                 # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
                 safe_vec_base = vec_base.to(device=current_device, dtype=current_dtype)
@@ -996,8 +992,6 @@ def main():
     parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
     parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
     parser.add_argument("--repeat", default=False, action="store_true", help="是否对prompt进行重复，作为一个baseline")
-    # 20260610 新增，对比重复多次抽取得到的delta h和重复一次之间的差异
-    parser.add_argument("--repeat_times", type=int, default=2, help="如果 --repeat 为 True，控制重复的次数（默认 2 次）,1即原始prompt不重复，2即重复一次，以此类推")
     parser.add_argument("--pad_repeat", default=False, action="store_true", help="是否使用pad字符把长度扩展到约2倍，作为对照baseline")
     parser.add_argument("--pad_factor", type=int, default=2, help="pad_repeat 时补齐倍率（默认 2 倍）")
     parser.add_argument("--max_length", type=int, help="控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异")
@@ -1011,10 +1005,7 @@ def main():
     
     # 20260427 新增gte模型
     parser.add_argument("--gte_model_path",type=str, default="/data_a100/models/gte-Qwen2-7B-instruct", help="gte model load path")
-    # 20260604 新增gte抽取干预向量的层数，默认为最后一层
-    parser.add_argument("--gte_same_layer", action="store_true", help="从GTE模型的哪一层抽取干预向量，默认为false（最后一层）,true 时抽取和llm干预的同层")
     parser.add_argument("--steering_mode", type=str, default="llm_steer",help="可选值llm_steer/gte_steer，分别代表用原始llm和gte模型抽取干预向量")
-
 
     args = parser.parse_args()
 
@@ -1031,12 +1022,12 @@ def main():
     print(f"==============================")
     
     # 1. Load Data
-    if not args.instance_steering and args.alpha != 0.0 and args.steering_mode != "gte_steer": # instance steering 模式下每个样例单独计算向量，且gte steer模式下向量来源于gte模型，不需要calib数据
+    if not args.instance_steering and args.alpha != 0.0:
         print(f"Loading calibration data from {args.calib_file} (max {args.calib_samples} samples)...")
         calib_data = load_data_file(args.calib_file, max_n=args.calib_samples)
     test_data = load_data_file(args.test_file, max_n=args.max_test_samples)
     
-    if not args.instance_steering and args.alpha != 0.0 and args.steering_mode != "gte_steer":
+    if not args.instance_steering and args.alpha != 0.0:
         if not calib_data:
             print("[Error] Calibration data empty.")
             return
@@ -1064,7 +1055,7 @@ def main():
     else:
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
         # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
-        steerer = ActivationSteerer(model, tokenizer, args)
+        steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
     
     # 如果是gte干预，则需要加载gte模型
     if args.steering_mode == "gte_steer":
@@ -1132,8 +1123,7 @@ def main():
                 batch_ex,
                 alpha=args.alpha,
                 gte_model=gte_model, 
-                gte_tokenizer=gte_tokenizer,
-                gte_same_layer=args.gte_same_layer
+                gte_tokenizer=gte_tokenizer
                 )
         else:
             # 模式 B: 使用之前计算好的全局平均向量 (原始逻辑)

@@ -137,22 +137,24 @@ def check_is_correct(prediction, ground_truth):
 # ==========================================
 
 class ActivationSteerer:
-    def __init__(self, model, tokenizer, layer_idx: int, max_length: int, batch_size: int = 4):
+    def __init__(self, model, tokenizer, args: argparse.Namespace):
         self.model = model
         self.tokenizer = tokenizer
-        self.layer_idx = layer_idx
+        self.layer_idx = args.layer
         self.device = model.device
         self.steering_vector = None # 用于存储计算出的 Δh
         self.tokenizer.padding_side = "left"
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.batch_size = batch_size
-        if max_length is not None:   # 非空的时候
-            self.max_length = max_length
+        self.batch_size = args.eval_batch_size
+        if args.max_length is not None:   # 非空的时候
+            self.max_length = args.max_length
             self.padding = "max_length"
         else:
             self.max_length = 8192
             self.padding = True # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
+        if args.repeat_times is not None:  # 新增控制重复次数的参数，即delta h从重复多少次的prompt中进行抽取
+            self.repeat_times = args.repeat_times
 
     def _get_layer_module(self):
         """自动寻找各模型的 transformer layers 容器"""
@@ -197,9 +199,9 @@ class ActivationSteerer:
         """
         batch_size = self.batch_size
         # print(f"\n[Steering] Computing difference vector over {len(data_samples)} calibration samples...")
-        print(f"\n[Steering] Computing normalized difference vector...")
+        print(f"\n[Steering] Computing normalized difference vector..., the repeat_times is {self.repeat_times}")
         prompts_single = [build_prompts(x, self.tokenizer, repeat=False) for x in data_samples]
-        prompts_repeat = [build_prompts(x, self.tokenizer, repeat=True) for x in data_samples]
+        prompts_repeat = [build_prompts(x, self.tokenizer, repeat=True, repeat_times=self.repeat_times) for x in data_samples]
         
         # 1. 提取两种 Prompt 的隐状态，特征
         h1 = self.extract_features(prompts_single, batch_size)
@@ -243,7 +245,7 @@ class ActivationSteerer:
         attn_list = []
         max_L = 0
         
-        for p in formatted:
+        for p in prompts:
             ids = self.tokenizer(p, add_special_tokens=False, padding=False, truncation=True, max_length=self.max_length)["input_ids"]
             real_len = len(ids)
             # 计算需要补充的 pad 数量
@@ -994,6 +996,8 @@ def main():
     parser.add_argument("--reverse_context", default=False, action="store_true", help="是否对context进行后置操作")
     parser.add_argument("--instance_steering", default=False, action="store_true", help="是否从单个样例的角度对激活进行干预")
     parser.add_argument("--repeat", default=False, action="store_true", help="是否对prompt进行重复，作为一个baseline")
+    # 20260610 新增，对比重复多次抽取得到的delta h和重复一次之间的差异
+    parser.add_argument("--repeat_times", type=int, default=2, help="如果 --repeat 为 True，控制重复的次数（默认 2 次）,1即原始prompt不重复，2即重复一次，以此类推")
     parser.add_argument("--pad_repeat", default=False, action="store_true", help="是否使用pad字符把长度扩展到约2倍，作为对照baseline")
     parser.add_argument("--pad_factor", type=int, default=2, help="pad_repeat 时补齐倍率（默认 2 倍）")
     parser.add_argument("--max_length", type=int, help="控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异")
@@ -1010,6 +1014,7 @@ def main():
     # 20260604 新增gte抽取干预向量的层数，默认为最后一层
     parser.add_argument("--gte_same_layer", action="store_true", help="从GTE模型的哪一层抽取干预向量，默认为false（最后一层）,true 时抽取和llm干预的同层")
     parser.add_argument("--steering_mode", type=str, default="llm_steer",help="可选值llm_steer/gte_steer，分别代表用原始llm和gte模型抽取干预向量")
+
 
     args = parser.parse_args()
 
@@ -1059,11 +1064,11 @@ def main():
     else:
         model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.bfloat16, device_map="auto")
         # model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=torch.float32, device_map="auto")
-        steerer = ActivationSteerer(model, tokenizer, layer_idx=args.layer, batch_size=args.eval_batch_size, max_length=args.max_length)
+        steerer = ActivationSteerer(model, tokenizer, args)
     
     # 如果是gte干预，则需要加载gte模型
     if args.steering_mode == "gte_steer":
-        gte_tokenizer = AutoTokenizer.from_pretrained(args.gte_model_path, trust_remote_code=True)
+        gte_tokenizer = AutoTokenizer.from_pretrained(args.gte_model_path, trust_remote_code=True, padding_side="left")
         config = AutoConfig.from_pretrained(args.gte_model_path, trust_remote_code=True)
         # 2. 手动补上缺失的属性 (Qwen2 默认通常是 1000000.0)
         if not hasattr(config, 'rope_theta'):
