@@ -155,6 +155,8 @@ class ActivationSteerer:
             self.padding = True # 控制输入的最大长度，对所有的batch padding到这个长度，避免由于不同padding带来的性能差异
         if args.repeat_times is not None:  # 新增控制重复次数的参数，即delta h从重复多少次的prompt中进行抽取
             self.repeat_times = args.repeat_times
+        # 新增一个差分或者平均的参数
+        self.mean_steering = args.mean_steering
 
     def _get_layer_module(self):
         """自动寻找各模型的 transformer layers 容器"""
@@ -205,9 +207,15 @@ class ActivationSteerer:
         
         # 1. 提取两种 Prompt 的隐状态，特征
         h1 = self.extract_features(prompts_single, batch_size)
-        h2 = self.extract_features(prompts_repeat, batch_size)
+        # 对比实验，直接取平均而非差分向量作为任务向量
+        if self.mean_steering:
+            self.steering_vector = h1.mean(dim=0) # 直接用重复prompt的平均向量作为 steering vector，看看效果如何
+            print(f"[Steering] Mean Vector computed. L2 Norm: {torch.norm(self.steering_vector):.4f}")
+            return self.steering_vector
 
-        # # 2. 计算平均差异向量
+        h2 = self.extract_features(prompts_repeat, batch_size)
+        
+        # # 2. 计算平均差异向量(经过实验，归一化之后对原始的隐层波动太小)
         # diffs = h2 - h1 
         # mean_diff = diffs.mean(dim=0) # [D]
 
@@ -905,78 +913,6 @@ def vllm_generate_batch(llm, prompts: List[str], max_new_tokens: int = 4096) -> 
     outputs = llm.generate(prompts, sampling_params)
     return [out.outputs[0].text for out in outputs]
 
-# 测试用embedding模型
-class GTEInjectedSteerer:
-    def __init__(self, reasoning_model, gte_model, tokenizer, layer_idx):
-        self.model = reasoning_model
-        self.gte_model = gte_model
-        self.tokenizer = tokenizer
-        self.layer_idx = layer_idx
-        self.device = reasoning_model.device
-    
-    # 可以更换不同的instruction
-    def format_gte_query(self, instruction, text_context):
-        # GTE 官方要求：Instruct:{任务}\nQuery:{内容}
-        return f"Instruct: {instruction}\nQuery: {text_context}"
-
-    @torch.no_grad()
-    def extract_gte_guidance_vector(self, instruction_text):
-        """
-        从 GTE 模型中提取指令引导向量
-        """
-        # GTE 官方推荐的 Prompt 格式
-        input_text = f"Instruct: {instruction_text}\nQuery: "
-        inputs = self.tokenizer(input_text, return_tensors="pt", padding=True).to(self.gte_model.device)
-        
-        # 提取 GTE 最后一层的隐藏状态
-        outputs = self.gte_model(**inputs, output_hidden_states=True)
-        # 获取最后一个 token 的表征 [1, Dim]
-        # 注意：GTE 默认会进行 L2 归一化，我们先拿到原始方向
-        gte_hidden = outputs.hidden_states[-1][:, -1, :]
-        return F.normalize(gte_hidden, p=2, dim=-1)
-
-    def inject_and_generate(self, prompts, guidance_vector, alpha=1.0):
-        """
-        将 GTE 向量缩放并注入推理模型
-        """
-        # 1. 编码推理任务的输入
-        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
-        
-        # 2. 定义带模长恢复的 Hook [cite: 310-353]
-        # 将 GTE 向量转移到推理模型精度和设备
-        vec_base = guidance_vector.to(device=self.device, dtype=self.model.dtype)
-
-        def gte_hook(module, args, output):
-            h = output[0] if isinstance(output, tuple) else output
-            # 只在 Prefill 阶段干预最后一个 token
-            if h.shape[1] > 1:
-                # --- 核心：模长对齐策略 ---
-                # 提取当前层原始激活值的平均模长
-                orig_token = h[:, -1, :]
-                orig_norm = torch.norm(orig_token, p=2, dim=-1, keepdim=True)
-                
-                # 缩放 GTE 向量：使干预信号的强度与原始激活值匹配
-                # 注入值 = 方向(vec_base) * 强度(alpha) * 基础能量(orig_norm)
-                scaled_vec = vec_base * alpha * orig_norm
-                
-                # 注入并保持总模长不变（防止数值崩溃）
-                steered_token = orig_token + scaled_vec
-                steered_norm = torch.norm(steered_token, p=2, dim=-1, keepdim=True)
-                h[:, -1, :] = steered_token * (orig_norm / (steered_norm + 1e-8))
-                
-            return (h,) + output[1:] if isinstance(output, tuple) else h
-
-        # 3. 注册并执行
-        layer_module = self.model.model.layers[self.layer_idx] # Qwen 架构适配
-        handle = layer_module.register_forward_hook(gte_hook)
-        
-        try:
-            out = self.model.generate(**inputs, max_new_tokens=128, do_sample=False)
-        finally:
-            handle.remove()
-            
-        return self.tokenizer.batch_decode(out, skip_special_tokens=True)
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -1015,6 +951,8 @@ def main():
     parser.add_argument("--gte_same_layer", action="store_true", help="从GTE模型的哪一层抽取干预向量，默认为false（最后一层）,true 时抽取和llm干预的同层")
     parser.add_argument("--steering_mode", type=str, default="llm_steer",help="可选值llm_steer/gte_steer，分别代表用原始llm和gte模型抽取干预向量")
 
+    # 20260612 新增一个平均值作为steering向量的功能
+    parser.add_argument("--mean_steering", action="store_true", help="是否直接使用校准集的平均激活作为steering向量，跳过求差分的步骤")
 
     args = parser.parse_args()
 

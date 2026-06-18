@@ -1,11 +1,11 @@
 #!/bin/bash
 
-GPU=0,1
+GPU=3
 export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
 # 1. 模型绝对路径
-MODEL_PATH="/pcl_data/users/laska/models/Qwen2.5-7B-Instruct"
+MODEL_PATH="/data_a100/models/Qwen2.5-14B-Instruct"
 MODEL_NAME=$(basename "$MODEL_PATH")
 GTE_MODEL_PATH='/pcl_data/users/laska/models/gte-Qwen2-7B-instruct'
 
@@ -29,7 +29,7 @@ USE_VLLM=true
 GTE_STEER=false    # 是否使用gte进行steering
 GTE_SAME_LAYER=true  # 是否抽取GTE模型和LLM干预的同一层，true表示抽取GTE模型的LAYERS中指定的层，false表示抽取GTE模型的最后一层
 
-MEAN_STEERING=true  # 是否使用平均steering（该值为true的时候delta h是直接取平均值而非差分向量）
+# MEAN_STEERING=true  # 是否使用平均steering（该值为true的时候delta h是直接取平均值而非差分向量）
 
 # MAX_TEST_SAMPLES=10           # 控制测试时的样本数量，避免测试时间过长（你可以根据需要调整这个值，或者设置为 None 来使用全部样本）
 
