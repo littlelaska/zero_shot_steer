@@ -1,11 +1,11 @@
 #!/bin/bash
 
-GPU=3
+GPU=0
 export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
 # 1. 模型绝对路径
-MODEL_PATH="/data_a100/models/Qwen2.5-14B-Instruct"
+MODEL_PATH="/home/hit/models/Qwen2.5-7B-Instruct"
 MODEL_NAME=$(basename "$MODEL_PATH")
 GTE_MODEL_PATH='/pcl_data/users/laska/models/gte-Qwen2-7B-instruct'
 
@@ -128,6 +128,7 @@ echo "RUN_CMD: ${BASELINE_CMD}"
 echo "--------------------------------------------------"
 ${BASELINE_CMD}
 
+<<<<<<< Updated upstream
 # laska修改，新增一个reverse的baseline
 echo "--------------------------------------------------"
 echo "Running Reverse Baseline (No Intervention, Alpha=0.0)"
@@ -138,6 +139,27 @@ if [ "$CONTEXT_REVERSE" = true ]; then
   echo "--------------------------------------------------"
   ${REVERSE_BASELINE_CMD}
 fi
+=======
+# # laska修改，新增一个reverse的baseline
+# echo "--------------------------------------------------"
+# echo "Running Reverse Baseline (No Intervention, Alpha=0.0)"
+# echo "--------------------------------------------------"
+# if [ "$CONTEXT_REVERSE" = true ]; then
+#   REVERSE_BASELINE_CMD="$BASELINE_CMD_ORI --reverse_context --output_file ${OUT_DIR}/results_reverse_baseline_alpha_0.0.jsonl"
+#   echo "RUN_CMD: ${REVERSE_BASELINE_CMD}"
+#   echo "--------------------------------------------------"
+#   ${REVERSE_BASELINE_CMD}
+# fi
+
+# # laska修改，新增一个prompt repeat的baseline
+# echo "--------------------------------------------------"
+# echo "Running Prompt Repeat Baseline (No Intervention, Alpha=0.0)"
+# echo "--------------------------------------------------"
+# REPEAT_CMD="$REPEAT_CMD --repeat --output_file ${OUT_DIR}/results_${EVAL_BATCH_SIZE}_repeat_baseline_alpha_0.0.jsonl"
+# echo "RUN_CMD: ${REPEAT_CMD}"
+# echo "--------------------------------------------------"
+# ${REPEAT_CMD}
+>>>>>>> Stashed changes
 
 # laska修改，新增一个prompt repeat的baseline
 echo "--------------------------------------------------"

@@ -131,7 +131,11 @@ def calculate_metrics(predictions, references, tgt_lang):
     print("="*40)
     print(f"BLEU Score  : {bleu_result.score:.2f}")
     print(f"ChrF++ Score: {chrf_result.score:.2f}")
-    print(f"SacreBLEU Signature: {bleu_result.signature}")
+    # print(f"SacreBLEU Signature: {bleu_result.signature}")
+    # 选项 A：使用 getattr 保护，如果找不到属性就输出 N/A，100% 不会崩溃（推荐）
+    print(f"SacreBLEU Signature: {getattr(bleu_result, 'signature', 'N/A')}")
+    # 如果你还想看到诸如 1-4 gram 的精确度、BP惩罚项等详细信息，可以加上下面这行：
+    print(f"Detailed BLEU Report: {bleu_result.format()}")
     print("="*40 + "\n")
 
 
