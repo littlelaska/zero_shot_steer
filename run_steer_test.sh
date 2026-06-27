@@ -5,7 +5,7 @@ export CUDA_VISIBLE_DEVICES="${GPU}"
 
 # ================= 配置区域 =================
 # 1. 模型绝对路径
-MODEL_PATH="/data_a100/models/Qwen2.5-14B-Instruct"
+MODEL_PATH="/home/hit/models/Qwen2.5-3B-Instruct"
 MODEL_NAME=$(basename "$MODEL_PATH")
 GTE_MODEL_PATH='/pcl_data/users/laska/models/gte-Qwen2-7B-instruct'
 

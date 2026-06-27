@@ -18,6 +18,9 @@ from sklearn.manifold import TSNE
 import torch.nn as nn
 from typing import Dict, List
 
+import sacrebleu
+from datasets import load_dataset
+
 # ==========================================
 # 1. 基础组件与数据处理
 # ==========================================
@@ -28,6 +31,59 @@ ASSISTANT_PROMPT = (
     "Finally, conclude your answer by strictly outputting the single option letter "
     "enclosed in LaTeX box format, for example: \\boxed{A}."
 )
+
+# 20260623 添加针对 flores数据集的处理逻辑
+# === FLORES Integration: 专门针对 FLORES 的本地文件数据加载器 ===
+def load_flores_data_normalized(src_lang, tgt_lang, shots=0, data_type="parquet", local_data_dir="data/flores"):
+    """将 FLORES 数据加载并归一化为通用字典格式"""
+    if data_type == "parquet":
+        src_test_path = os.path.join(local_data_dir, f"{src_lang}/devtest-00000-of-00001.parquet")
+        tgt_test_path = os.path.join(local_data_dir, f"{tgt_lang}/devtest-00000-of-00001.parquet")
+        if shots > 0:
+            src_dev_path = os.path.join(local_data_dir, f"{src_lang}/dev-00000-of-00001.parquet")
+            tgt_dev_path = os.path.join(local_data_dir, f"{tgt_lang}/dev-00000-of-00001.parquet")   
+    else:
+        local_data_dir = "data/flores101_dataset"
+        src_test_path = os.path.join(local_data_dir, f"devtest/{src_lang}.devtest")
+        tgt_test_path = os.path.join(local_data_dir, f"devtest/{tgt_lang}.devtest")
+        if shots > 0:
+            src_dev_path = os.path.join(local_data_dir, f"dev/{src_lang}.dev")
+            tgt_dev_path = os.path.join(local_data_dir, f"dev/{tgt_lang}.dev")
+
+    key_name = "sentence" if data_type == "parquet" else "text"
+    
+    # 加载测试集
+    src_test = load_dataset("parquet" if data_type == "parquet" else "text", data_files=src_test_path, split="train")
+    tgt_test = load_dataset("parquet" if data_type == "parquet" else "text", data_files=tgt_test_path, split="train")
+    
+    test_normalized = [
+    {
+        "sentence": s[key_name], 
+        "answer": t[key_name], 
+        "is_flores": True,
+        "src_lang": src_lang,  # 👈 注入源语言代码
+        "tgt_lang": tgt_lang   # 👈 注入目标语言代码
+    } 
+    for s, t in zip(src_test, tgt_test)
+]
+    
+    calib_normalized = []
+    if shots > 0:
+        src_dev = load_dataset("parquet" if data_type == "parquet" else "text", data_files=src_dev_path, split="train")
+        tgt_dev = load_dataset("parquet" if data_type == "parquet" else "text", data_files=tgt_dev_path, split="train")
+        calib_normalized = [
+        {
+            "sentence": s[key_name], 
+            "answer": t[key_name], 
+            "is_flores": True,
+            "src_lang": src_lang,  # 👈 注入
+            "tgt_lang": tgt_lang   # 👈 注入
+        } 
+        for s, t in zip(src_dev, tgt_dev)
+    ]
+        
+    return test_normalized, calib_normalized
+
 
 def load_data_file(path: str, max_n: int = None):
     data = []
@@ -78,7 +134,46 @@ def build_prompts(ex, tokenizer=None, repeat=False, reverse_context=False, pad_r
     构建 Prompt。如果 repeat=True，则应用论文中的 Query + Query 策略。
     - repeat=True: 语义重复 Query + Query（论文里的 Prompt Repetition）。
     - pad_repeat=True: 用 pad 字符把 token 长度扩到约 2 倍（语义不变），用于和 repeat 对比。
+    20260623 新增flores数据集处理逻辑
     """
+    # === FLORES Integration: 翻译任务提示词重定向分支 ===
+    if ex.get("is_flores", False):
+        src_text = ex.get("sentence", "")
+        # 语言代码映射
+        lang_mapping = {
+            "eng_Latn": "English", "zho_Hans": "Chinese (Simplified)", "zho_Hant": "Chinese (Traditional)",
+            "deu_Latn": "German", "fra_Latn": "French", "jpn_Jpan": "Japanese",
+            "zho_simpl": "Chinese (Simplified)", "zho_trad": "Chinese (Traditional)", "eng": "English",
+            "jpn": "Japanese", "deu": "German", "fra": "French",
+            "kor": "Korean", "spa": "Spanish", "ita": "Italian", "rus": "Russian",
+        }
+        # 从当前样本中动态提取语言标签，不再写死
+        src_lang_code = ex.get("src_lang", "eng_Latn")
+        tgt_lang_code = ex.get("tgt_lang", "zho_Hans")
+        src_name = lang_mapping.get(src_lang_code, src_lang_code)
+        tgt_name = lang_mapping.get(tgt_lang_code, tgt_lang_code)
+        
+        # 1. 针对 Chat 模型的翻译 Prompt 逻辑
+        if tokenizer and hasattr(tokenizer, "apply_chat_template"):
+            messages = []
+            system_prompt = f"You are a professional translator. Translate the following text from {src_name} to {tgt_name}. Provide only the final translation without any explanations or extra commentary."
+            messages.append({"role": "system", "content": system_prompt})
+            
+            if repeat:
+                current_user = f"Text to translate:\n{src_text}\n\nRemember: Translate the above text from {src_name} to {tgt_name}. Provide only the final translation without any commentary:\n{src_text}"
+            else:
+                current_user = f"Text to translate:\n{src_text}"
+                
+            messages.append({"role": "user", "content": current_user})
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        # 2. 针对 Base 模型的翻译 Prompt 逻辑
+        else:
+            if repeat:
+                return f"Source: {src_text}\nRemember: Translate the above text from {src_name} to {tgt_name}.\nSource (repeated): {src_text}\nTarget:"
+            return f"Source: {src_text}\nTarget:"
+
+    # ==================== 原始逻辑：逻辑推理任务 ====================
     ctx = ex.get("context", "")
     q = ex.get("question", "").lstrip("Question: ")     # 针对commonsense数据集需要去掉前面的question
     opts = _format_options_from_ex(ex)
@@ -131,6 +226,31 @@ def check_is_correct(prediction, ground_truth):
     clean_text = re.sub(r"[^A-G]", "", prediction.split("Answer")[-1])
     if clean_text: return clean_text[-1] == ground_truth
     return False
+
+# === FLORES Integration: 学术规范指标评估函数 ===
+def calculate_flores_metrics(predictions, references, tgt_lang):
+    """计算标准的 BLEU 和 ChrF++ 指标"""
+    print("\n[*] Running sacrebleu metric engine for FLORES...")
+    # 动态、严格地根据目标语种选择官方推荐的分词策略
+    if "zho" in tgt_lang or "zh" in tgt_lang:
+        tokenize_strategy = "zh"
+    elif "jpn" in tgt_lang or "ja" in tgt_lang:
+        tokenize_strategy = "ja-mecab"
+    elif "kor" in tgt_lang or "ko" in tgt_lang:
+        tokenize_strategy = "ko-mecab"
+    else:
+        tokenize_strategy = "13a"
+        
+    bleu_result = sacrebleu.corpus_bleu(predictions, [references], tokenize=tokenize_strategy)
+    chrf_result = sacrebleu.corpus_chrf(predictions, [references])
+    
+    print("\n" + "="*40)
+    print(f"📊 FLORES Translation Results ({tgt_lang})")
+    print("="*40)
+    print(f"BLEU Score  : {bleu_result.score:.2f}")
+    print(f"ChrF++ Score: {chrf_result.score:.2f}")
+    print(f"SacreBLEU Signature: {getattr(bleu_result, 'signature', 'N/A')}")
+    print("="*40 + "\n")
 
 # ==========================================
 # 2. 核心算法：Zero-shot Activation Steering
@@ -293,9 +413,11 @@ class ActivationSteerer:
         else:
             padding = "max_length"
         if alpha != 0.0:   # 对中间向量进行干预
-            print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
+            # print(f"\n[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
+            tqdm.write(f"[Steering] Applying steering with alpha={alpha} in {intervention_mode} mode...")
             inputs = self.tokenizer(prompts, return_tensors="pt", padding=padding, truncation=True, max_length=max_length).to(self.device)
-            print(inputs.input_ids.shape)
+            # print(inputs.input_ids.shape)
+            tqdm.write(str(inputs.input_ids.shape))
             # 移除这里的 .to(self.device)，我们将在 hook 中动态匹配设备
             vec_base = (self.steering_vector * alpha).to(self.model.dtype)
 
@@ -314,7 +436,8 @@ class ActivationSteerer:
                     
                     # 仅在 Prefill 阶段或第一个 Token 时打印，避免日志刷屏
                     if seq_len > 1:
-                        print(f" > [Layer {self.layer_idx}] Norm Ratio: {ratio:.2%} (Orig: {orig_norm:.2f}, Steer: {steer_norm:.2f}), Orig Std: {orig_std:.2f}")
+                        # print(f" > [Layer {self.layer_idx}] Norm Ratio: {ratio:.2%} (Orig: {orig_norm:.2f}, Steer: {steer_norm:.2f}), Orig Std: {orig_std:.2f}")
+                        tqdm.write(f" > [Layer {self.layer_idx}] Norm Ratio: {ratio:.2%} (Orig: {orig_norm:.2f}, Steer: {steer_norm:.2f}), Orig Std: {orig_std:.2f}")
                 # ------------------ 判断是否干预 ------------------
                 
                 should_intervene = False
@@ -414,7 +537,8 @@ class ActivationSteerer:
             if alpha != 0.0 and handle is not None:
                 handle.remove() # 确保 Hook 被移除
             
-        return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
+        # return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
+        return self.tokenizer.batch_decode(gen_out[:, inputs.input_ids.shape[-1]:], skip_special_tokens=True)
     
     # ... 原有的 __init__ 和 extract_features 保持不变 ...
     def generate_with_instance_steering(self, prompts: List[str], alpha: float = 1.0, intervention_mode: str = "static", max_length: int = None):
@@ -501,7 +625,8 @@ class ActivationSteerer:
         finally:
             handle.remove()
             
-        return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
+        return self.tokenizer.batch_decode(gen_out[:, inputs.input_ids.shape[-1]:], skip_special_tokens=True)
+        # return self.tokenizer.batch_decode(gen_out, skip_special_tokens=True)
     
     def generate_with_gte_steering(self, prompts: List[str], alpha: float = 1.0, gte_model=None, gte_tokenizer=None, max_length: int = None, gte_same_layer=False):
         if max_length is None:
@@ -917,8 +1042,8 @@ def vllm_generate_batch(llm, prompts: List[str], max_new_tokens: int = 4096) -> 
 def main():
     parser = argparse.ArgumentParser()
     # 用少量的源域数据作为校准集（求差分），无需标签！
-    parser.add_argument("--calib_file", type=str, required=True, help="用于计算干预向量的无标签校准集")
-    parser.add_argument("--test_file", type=str, required=True, help="用于最终测试的文件")
+    parser.add_argument("--calib_file", type=str, default=None, help="用于计算干预向量的无标签校准集")
+    parser.add_argument("--test_file", type=str, default=None, help="用于最终测试的文件")
     parser.add_argument("--output_file", type=str, default="steering_results.jsonl")
     
     parser.add_argument("--model", type=str, default="google/gemma-3-27b-it") 
@@ -940,6 +1065,13 @@ def main():
     parser.add_argument("--dataset", type=str, default="LogicalDeduction", help="当前测试的数据集名称，用于分析和命名输出文件")
     # 新增一个，选取部分数据用于测试
     parser.add_argument("--max_test_samples", type=int, default = 1000, help="如果指定，则仅使用前 N 条测试数据进行推理")
+    
+    # === FLORES 专属参数挂载 ===
+    parser.add_argument("--data_type", type=str, default="parquet", choices=["parquet", "text"])
+    parser.add_argument("--src_lang", type=str, default="eng_Latn")
+    parser.add_argument("--tgt_lang", type=str, default="zho_Hans")
+    parser.add_argument("--flores_dir", type=str, default="data/flores")
+   
     # vLLM：仅用于无 steer 的 baseline（alpha=0），与 HF 路径共用同一套 build_prompts
     parser.add_argument("--use_vllm", action="store_true", help="使用 vLLM 推理（仅支持 alpha=0、非 instance_steering；不支持 pad_repeat）")
     parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.9, help="vLLM gpu_memory_utilization")
@@ -955,7 +1087,7 @@ def main():
     parser.add_argument("--mean_steering", action="store_true", help="是否直接使用校准集的平均激活作为steering向量，跳过求差分的步骤")
 
     args = parser.parse_args()
-
+    
     if args.use_vllm:
         if args.alpha != 0.0:
             raise SystemExit("--use_vllm 仅支持无干预 baseline，请设 --alpha 0.0")
@@ -963,16 +1095,26 @@ def main():
             raise SystemExit("--use_vllm 与 --instance_steering 不兼容（实例级 steer 需 HF forward hook）")
 
     print(f"=== Zero-shot Steering PoC ===")
-    print(f"Model: {args.model}")
+    print(f"Model: {args.model} | Task Dataset: {args.dataset}")
     print(f"Dataset:{args.test_file}")
     print(f"Layer: {args.layer} | Alpha: {args.alpha} | Mode: {args.intervention_mode}")
     print(f"==============================")
     
-    # 1. Load Data
-    if not args.instance_steering and args.alpha != 0.0 and args.steering_mode != "gte_steer": # instance steering 模式下每个样例单独计算向量，且gte steer模式下向量来源于gte模型，不需要calib数据
-        print(f"Loading calibration data from {args.calib_file} (max {args.calib_samples} samples)...")
-        calib_data = load_data_file(args.calib_file, max_n=args.calib_samples)
-    test_data = load_data_file(args.test_file, max_n=args.max_test_samples)
+    # 1. Load Data (多分支自适应切换)
+    if args.dataset.lower() == "flores":
+        # === FLORES Integration: 统一加载与格式化封装 ===
+        print(f"[*] Route to FLORES Translation Stream. Loading pairs: {args.src_lang} -> {args.tgt_lang}")
+        test_data, calib_data = load_flores_data_normalized(
+            src_lang=args.src_lang, tgt_lang=args.tgt_lang, 
+            shots=args.calib_samples, data_type=args.data_type, local_data_dir=args.flores_dir
+        )
+        test_data = test_data[:args.max_test_samples]
+    else:
+        # 原始逻辑：常规逻辑推理数据集加载
+        if not args.instance_steering and args.alpha != 0.0 and args.steering_mode != "gte_steer": # instance steering 模式下每个样例单独计算向量，且gte steer模式下向量来源于gte模型，不需要calib数据
+            print(f"Loading calibration data from {args.calib_file} (max {args.calib_samples} samples)...")
+            calib_data = load_data_file(args.calib_file, max_n=args.calib_samples)
+        test_data = load_data_file(args.test_file, max_n=args.max_test_samples)
     
     if not args.instance_steering and args.alpha != 0.0 and args.steering_mode != "gte_steer":
         if not calib_data:
@@ -1047,7 +1189,9 @@ def main():
     print(f"\n=== Starting Inference ===")
     os.makedirs(os.path.dirname(args.output_file) or ".", exist_ok=True)
     open(args.output_file, "w").close() 
-
+    
+    all_predictions = []
+    all_references = []
     correct_count = 0
     total_count = 0
     pbar = tqdm(total=len(test_data), desc="Evaluating")
@@ -1094,10 +1238,17 @@ def main():
             for j, output_text in enumerate(batch_outputs):
                 ex = batch_ex[j]
                 ground_truth = ex.get("answer", "").strip()
-                is_correct = check_is_correct(output_text, ground_truth)
-                
-                if is_correct: correct_count += 1
+
+                all_predictions.append(output_text)
+                all_references.append(ground_truth)
                 total_count += 1
+
+                # 指标打分分支
+                if args.dataset.lower() == "flores":
+                    is_correct = "N/A (BLEU Task)"
+                else:
+                    is_correct = check_is_correct(output_text, ground_truth)
+                    if is_correct: correct_count += 1
                 
                 f.write(json.dumps({
                     "id": ex.get("id", str(total_count)),
@@ -1107,10 +1258,15 @@ def main():
                 }, ensure_ascii=False) + "\n")
         
         pbar.update(len(batch_ex))
-        pbar.set_postfix({"Acc": f"{correct_count/total_count:.2%}"})
+        if args.dataset.lower() != "flores":
+            pbar.set_postfix({"Acc": f"{correct_count/total_count:.2%}"})
 
     pbar.close()
-    print(f"\nDone! Final Accuracy: {correct_count/total_count:.2%}")
+    # 5. 后置全局学术指标打印
+    if args.dataset.lower() == "flores":
+        calculate_flores_metrics(all_predictions, all_references, args.tgt_lang)
+    else:
+        print(f"\nDone! Final Accuracy: {correct_count/total_count:.2%}")
 
 if __name__ == "__main__":
     main()

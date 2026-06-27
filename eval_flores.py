@@ -85,7 +85,8 @@ def build_prompts(src_test, src_lang, tgt_lang, is_chat_model, tokenizer, data_t
         "eng_Latn": "English", "zho_Hans": "Chinese (Simplified)", "zho_Hant": "Chinese (Traditional)",
         "deu_Latn": "German", "fra_Latn": "French", "jpn_Jpan": "Japanese",
         "eng": "English", "zho_simpl": "Chinese (Simplified)", "zho_trad": "Chinese (Traditional)",
-        "deu": "German", "fra": "French", "jpn": "Japanese"
+        "deu": "German", "fra": "French", "jpn": "Japanese",
+        "kor": "Korean", "spa_Latn": "Spanish", "rus_Cyrl": "Russian",
     }
     src_name = lang_mapping.get(src_lang, src_lang)
     tgt_name = lang_mapping.get(tgt_lang, tgt_lang)

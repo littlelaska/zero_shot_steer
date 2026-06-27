@@ -1,4 +1,4 @@
-GPU=7
+GPU=1,2,3,4
 export CUDA_VISIBLE_DEVICES="${GPU}"
 MODEL_PATH="/home/hit/models/Qwen2.5-3B-Instruct"
 DATA_TYPE="text"   # 可选 parquet 或 text，影响加载文件的路径
@@ -6,7 +6,7 @@ DATA_TYPE="text"   # 可选 parquet 或 text，影响加载文件的路径
 python eval_flores.py \
     --model_name ${MODEL_PATH} \
     --data_type ${DATA_TYPE} \
-    --src_lang eng \
-    --tgt_lang zho_simpl \
+    --src_lang tur \
+    --tgt_lang eng \
     --shots 0 \
-    --prompt_strategy "repeated"
+    --prompt_strategy "single"
