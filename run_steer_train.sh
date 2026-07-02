@@ -11,7 +11,7 @@ GTE_MODEL_PATH='/pcl_data/users/laska/models/gte-Qwen2-7B-instruct'
 
 # 2. 实验参数 (Zero-shot Steering)
 # 因为是零样本干预，我们不再需要区分 SOURCE，直接在特定数据集上验证
-DATASET="AR-LSAT"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
+DATASET="commonsense"  # 也可以换成 "FOLIO" 或 "ProofWriter"(LogicalDeduction FOLIO ProntoQA AR-LSAT ProofWriter)
 LAYERS="6 10 12 16 20 24 26 30 34"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 LAYERS="6 10 14 18 22 26 30 34 38 42 44"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
 # LAYERS="6 10 12 16 20 24 26"        # 建议扫几个不同的层位，寻找“全局信息整合”最集中的层
